@@ -1,0 +1,91 @@
+Python
+------------------------------------------------------------------------------
+Byte-compiled / optimized / DLL files
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+C extensions
+*.so
+
+Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+Poetry
+It's generally recommended to commit poetry.lock for applications to ensure
+consistent dependencies, but you can uncomment it if you prefer.
+poetry.lock
+PyInstaller
+Usually these files are created by pyinstaller, if you are using it.
+*.spec
+
+Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+Virtual Environments
+.env
+.venv
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+IDE / Editor specific
+------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+macOS
+------------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+Project-specific Output & Data Directories
+------------------------------------------------------------------------------
+Ignore data directories that are not part of the source code
+data/
+prepared_for_upload/
+comparison_results/
+tei_output/
+
+Ignore database files and other large output files
+*.db
+*.sqlite3
+*.ndjson
