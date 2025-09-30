@@ -288,7 +288,7 @@ class OptimizedChunkingService:
         chunks = []
         for i, text in enumerate(texts):
             if len(text.strip()) >= 10:
-                token_count = len(TOKENIZER.encode(text)) if TOKENIZER else None
+                token_count = len(TOKENIZER.encode(text)) if TOKENIZER else 0
                 
                 chunk = Chunk(
                     id=f"{document.id}_chunk_{i}",

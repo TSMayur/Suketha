@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import List, Dict, Any
 from pymilvus import MilvusClient, DataType
 
-# At the top of tei_pipeline.py, change imports to:
 from project.pydantic_models import ProcessingConfig, ChunkingMethod
 from project.doc_reader import DocumentReader
 from project.chunker import OptimizedChunkingService
@@ -30,6 +29,15 @@ class TEIMilvusPipeline:
         self.tei_endpoint = tei_endpoint
         self.client = None
         self.collection_name = "rag_chunks_tei"
+        
+        # Initialize local MPS preprocessing for text optimization
+        import torch
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        if self.device == "mps":
+            logger.info("Using MPS (Metal Performance Shaders) for local preprocessing")
+            torch.backends.mps.allow_tf32 = True
+        else:
+            logger.info("MPS not available, using CPU for preprocessing")
         
     def _setup_milvus_client(self):
         """Initialize Milvus client and collection with TEI embedding function."""
@@ -56,18 +64,10 @@ class TEIMilvusPipeline:
         schema.add_field("content_type", DataType.VARCHAR, max_length=50)
         schema.add_field("embedding_model", DataType.VARCHAR, max_length=200)
         schema.add_field("created_at", DataType.VARCHAR, max_length=50)
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=768)  # Assuming BERT-like model
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=768)  # DistilRoBERTa uses 768 dims
         
-        # Create embedding function for TEI
-        from pymilvus.model.hybrid import BGEM3EmbeddingFunction
-        
-        # Note: You might need to adjust this based on your TEI setup
-        # This is a placeholder - the actual TEI integration might be different
-        embedding_fn = BGEM3EmbeddingFunction(
-            model_name='BAAI/bge-m3',
-            device='cpu',  # TEI handles GPU acceleration
-            use_fp16=False
-        )
+        # TEI will generate embeddings manually via HTTP requests
+        # No need for Milvus embedding functions
         
         # Index parameters
         index_params = self.client.prepare_index_params()
@@ -161,11 +161,53 @@ class TEIMilvusPipeline:
             return []
     
     def _prepare_chunks_for_tei(self, chunk_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Prepare chunks for TEI insertion (no local embeddings needed)."""
-        prepared_chunks = []
+        """Prepare chunks with TEI embeddings."""
+        import requests
         
-        for chunk in chunk_dicts:
-            # Remove any existing embedding data since TEI will generate it
+        prepared_chunks = []
+        texts = [chunk.get("chunk_text", "") for chunk in chunk_dicts]
+        
+        # Get embeddings from TEI in batches
+        embeddings = []
+        batch_size = 32  # Process in smaller batches
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            try:
+                response = requests.post(
+                    f"{self.tei_endpoint}/embed",
+                    json={"inputs": batch_texts},
+                    headers={"Content-Type": "application/json"}
+                )
+                response.raise_for_status()
+                batch_embeddings = response.json()
+                
+                # TEI returns embeddings directly as arrays, not wrapped
+                if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0:
+                    if isinstance(batch_embeddings[0], list):
+                        # Direct array format
+                        embeddings.extend(batch_embeddings)
+                    else:
+                        # Single embedding case
+                        embeddings.append(batch_embeddings)
+                else:
+                    logger.error(f"Unexpected TEI response format: {type(batch_embeddings)}")
+                    return []
+                    
+            except Exception as e:
+                logger.error(f"TEI batch embedding failed: {e}")
+                logger.error(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
+                logger.error(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
+                return []
+        
+        for chunk, embedding in zip(chunk_dicts, embeddings):
+            # Ensure embedding is a proper list of floats
+            if isinstance(embedding, list) and all(isinstance(x, (int, float)) for x in embedding):
+                embedding_vector = [float(x) for x in embedding]
+            else:
+                logger.error(f"Invalid embedding format: {type(embedding)}, content: {embedding}")
+                continue
+                
             prepared_chunk = {
                 "chunk_id": chunk.get("id", chunk.get("chunk_id")),
                 "doc_id": chunk.get("doc_id"),
@@ -177,8 +219,9 @@ class TEIMilvusPipeline:
                 "chunk_overlap": chunk.get("chunk_overlap", 0),
                 "domain": chunk.get("domain", "general"),
                 "content_type": chunk.get("content_type", "text"),
-                "embedding_model": "huggingface-tei",  # Mark as TEI-generated
-                "created_at": chunk.get("created_at", "")
+                "embedding_model": "huggingface-tei",
+                "created_at": chunk.get("created_at", ""),
+                "embedding": embedding_vector  # Properly formatted float array
             }
             prepared_chunks.append(prepared_chunk)
         

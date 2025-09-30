@@ -37,7 +37,7 @@ class Chunk(BaseModel):
     chunk_index: int
     chunk_text: str
     chunk_size: int
-    chunk_tokens: Optional[int] = None
+    chunk_tokens: int
     chunk_method: ChunkingMethod
     chunk_overlap: int
     domain: str = "general"
