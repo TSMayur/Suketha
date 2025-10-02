@@ -1,4 +1,3 @@
-# src/project/complete_pipeline_async_fixed.py
 
 import argparse
 import asyncio
