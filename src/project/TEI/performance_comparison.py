@@ -10,7 +10,7 @@ from typing import Dict, Any, List
 import json
 
 from project.pydantic_models import ProcessingConfig
-from project.complete_pipeline import CompleteOptimizedPipeline
+from project.complete_pipeline_gpu import CompleteOptimizedPipeline
 from project.tei_pipeline import TEIMilvusPipeline
 
 logging.basicConfig(

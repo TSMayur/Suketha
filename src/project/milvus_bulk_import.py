@@ -189,32 +189,33 @@ class EnhancedMilvusBulkImporter:
 
     def _monitor_bulk_import(self, task_id, file_path):
         """Separate method to monitor bulk import progress"""
+        # Monitor the job with cleaner logging
         check_count = 0
         while True:
             check_count += 1
             state = utility.get_bulk_insert_state(task_id=task_id)
             
-            logging.info(f"📊 Check #{check_count} - Task {task_id} state: {state.state_name}")
+            progress = f"Progress: {state.progress}%" if hasattr(state, 'progress') else ""
+            rows = f"Rows processed: {state.row_count}" if hasattr(state, 'row_count') else ""
             
-            if hasattr(state, 'row_count'):
-                logging.info(f"   Rows processed: {state.row_count}")
-            if hasattr(state, 'progress'):
-                logging.info(f"   Progress: {state.progress}")
-            if hasattr(state, 'infos'):
-                logging.info(f"   Info: {state.infos}")
-                
-            if state.state_name in ["Completed", "Failed"]:
-                if state.state_name == "Failed":
-                    logging.error(f"❌ Bulk import failed!")
-                    logging.error(f"   Reason: {state.failed_reason}")
-                    raise Exception(f"Bulk import failed: {state.failed_reason}")
-                else:
-                    logging.info(f"✅ Bulk import completed successfully!")
-                    if hasattr(state, 'row_count'):
-                        logging.info(f"   Total rows imported: {state.row_count}")
+            logging.info(f"📊 Check #{check_count} - Task {task_id} state: {state.state_name}. {rows} {progress}")
+            
+            if state.state_name == "Completed":
+                logging.info(f"✅ Bulk import completed successfully!")
+                if hasattr(state, 'row_count'):
+                    logging.info(f"   Total rows imported: {state.row_count}")
+                break
+            
+            if state.state_name == "Failed":
+                logging.error(f"❌ Bulk import failed!")
+                logging.error(f"   Reason: {state.failed_reason}")
+                if "key does not exist" in str(state.failed_reason).lower():
+                    logging.error("🔍 This looks like a field name mismatch issue!")
+                    logging.error("   Run the enhanced diagnostic script to compare schemas.")
                 break
                 
             time.sleep(5)
+
     def run_with_validation(self, collection_name: str, file_path: Path):
         """Run complete bulk import process with validation"""
         logging.info("🔄 Starting enhanced bulk import process...")
