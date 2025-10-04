@@ -84,8 +84,21 @@ data/
 prepared_for_upload/
 comparison_results/
 tei_output/
+submission_files/
+logs/
+models/
+outputs/
+
 
 Ignore database files and other large output files
 *.db
 *.sqlite3
 *.ndjson
+*.jsonl
+*.json
+*.tsv
+*.csv
+*.parquet
+*.pkl
+*.model
+*.bin   
