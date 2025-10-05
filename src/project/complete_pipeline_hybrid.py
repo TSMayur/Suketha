@@ -1,3 +1,4 @@
+# src/project/complete_pipeline_final.py
 
 import argparse
 import asyncio
@@ -8,8 +9,7 @@ import os
 import gc
 from pathlib import Path
 from typing import List, Dict, Any
-import multiprocessing as mp
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 
 from project.pydantic_models import ProcessingConfig, EmbeddingModel
 from project.doc_reader import DocumentReader
@@ -17,239 +17,290 @@ from project.chunker import OptimizedChunkingService
 from project.milvus_bulk_import import EnhancedMilvusBulkImporter
 from sentence_transformers import SentenceTransformer
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Global model - loaded once per worker
-_MODEL = None
 
-def _init_worker():
-    """Initialize model ONCE when worker starts"""
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer(
-            EmbeddingModel.ALL_MPNET_BASE_V2.value,
-            device='cpu'
-        )
-        logger.info(f"Worker {mp.current_process().name} initialized")
-
-def _embed_batch(texts: List[str]) -> List[List[float]]:
-    """Embed using pre-loaded global model"""
-    global _MODEL
-    return _MODEL.encode(
-        texts,
-        batch_size=32,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    ).tolist()
-
-
-class FixedAsyncPipeline:
-    """Fixed pipeline with proper worker pool management"""
+class FinalOptimizedPipeline:
+    """
+    Final optimized pipeline for CPU:
+    - Model loaded ONCE at startup
+    - Large batches (128 chunks) for efficient processing
+    - Async I/O to overlap operations
+    - Thermal management with cooling breaks
+    - Minimal memory overhead
+    """
     
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.workers = max(4, mp.cpu_count() - 2)  # More workers
         
-        # Create pool ONCE and reuse it
-        self.pool = Pool(
-            processes=self.workers,
-            initializer=_init_worker
+        # Load model ONCE - this is the key optimization
+        logger.info("Loading embedding model (one-time operation)...")
+        start = time.time()
+        self.embedding_model = SentenceTransformer(
+            EmbeddingModel.ALL_MPNET_BASE_V2.value,
+            device='cpu'
+        )
+        logger.info(f"Model loaded in {time.time()-start:.2f}s")
+        
+        # Optimal settings for CPU
+        self.embedding_batch_size = 128  # Sweet spot for CPU
+        self.write_batch_size = 300      # Write in larger chunks
+        
+        # Thread pool for I/O operations only
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        logger.info(f"Pipeline ready: batch_size={self.embedding_batch_size}")
+
+    def _embed_batch_sync(self, texts: List[str]) -> List[List[float]]:
+        """Synchronous embedding - model already loaded"""
+        embeddings = self.embedding_model.encode(
+            texts,
+            batch_size=self.embedding_batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        return embeddings.tolist()
+
+    async def _embed_chunks_async(self, chunk_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Async wrapper for embedding"""
+        if not chunk_dicts:
+            return []
+        
+        texts = [chunk['chunk_text'] for chunk in chunk_dicts]
+        start_time = time.time()
+        
+        # Run in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            self.executor,
+            self._embed_batch_sync,
+            texts
         )
         
-        logger.info(f"Pipeline: {self.workers} workers, models pre-loaded")
-
-    async def _embed_async(self, chunks: List[Dict]) -> List[Dict]:
-        """Async embedding with persistent pool"""
-        if not chunks:
-            return []
-        
-        texts = [c['chunk_text'] for c in chunks]
-        start = time.time()
-        
-        # Larger batches - 50 chunks per worker task
-        batch_size = 50
-        batches = [texts[i:i+batch_size] for i in range(0, len(texts), batch_size)]
-        
-        # Submit to pool asynchronously
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.run_in_executor(None, self.pool.apply, _embed_batch, (batch,))
-            for batch in batches
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        
-        # Flatten
-        embeddings = [e for batch in results for e in batch]
-        
         # Update chunks
-        for c, emb in zip(chunks, embeddings):
-            c['embedding'] = emb
-            c['embedding_model'] = EmbeddingModel.ALL_MPNET_BASE_V2.value
+        for chunk, embedding in zip(chunk_dicts, embeddings):
+            chunk['embedding'] = embedding
+            chunk['embedding_model'] = EmbeddingModel.ALL_MPNET_BASE_V2.value
         
-        speed = len(texts) / (time.time() - start)
-        logger.info(f"Embedded {len(texts)} in {time.time()-start:.2f}s ({speed:.1f}/s)")
+        duration = time.time() - start_time
+        speed = len(texts) / duration if duration > 0 else 0
+        logger.info(f"Embedded {len(texts)} chunks in {duration:.2f}s ({speed:.1f} chunks/sec)")
         
-        del texts, batches, embeddings, results
-        gc.collect()
-        
-        return chunks
+        return chunk_dicts
 
-    async def _write_async(self, chunks: List[Dict], path: Path, first: bool):
-        """Async JSON write"""
-        if not chunks:
-            return
+    def _initialize_json_file(self, file_path: Path):
+        """Initialize JSON file"""
+        if os.path.exists(file_path):
+            os.remove(file_path)
         
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._write_sync, chunks, path, first)
-
-    def _write_sync(self, chunks: List[Dict], path: Path, first: bool):
-        """Synchronous write"""
-        with open(path, 'a', encoding='utf-8') as f:
-            for i, c in enumerate(chunks):
-                if not first or i > 0:
-                    f.write(',\n')
-                
-                data = {
-                    "chunk_id": c.get("chunk_id", f"c_{i}"),
-                    "doc_id": c.get("doc_id", ""),
-                    "chunk_index": c.get("chunk_index", i),
-                    "chunk_text": c.get("chunk_text", ""),
-                    "chunk_size": c.get("chunk_size", 0),
-                    "chunk_tokens": c.get("chunk_tokens", 0),
-                    "chunk_method": c.get("chunk_method", "recursive"),
-                    "chunk_overlap": c.get("chunk_overlap", 0),
-                    "domain": c.get("domain", "general"),
-                    "content_type": c.get("content_type", "text"),
-                    "embedding_model": c.get("embedding_model", ""),
-                    "created_at": c.get("created_at", ""),
-                    "embedding": c.get("embedding", [])
-                }
-                
-                if not data["embedding"]:
-                    continue
-                
-                f.write('    ' + json.dumps(data, ensure_ascii=False))
-
-    async def _process_file_async(self, fp: Path) -> List[Dict]:
-        """Async file processing"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._process_sync, fp)
-
-    def _process_sync(self, fp: Path) -> List[Dict]:
-        """Sync processing"""
-        try:
-            doc = DocumentReader.read_file(fp)
-            if not doc:
-                return []
-            chunks = OptimizedChunkingService.chunk_document(doc, self.config)
-            return [c.model_dump(by_alias=False) for c in chunks]
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            return []
-
-    async def run_async(self, input_dir: str, output_dir: str, bulk_import: bool = True):
-        """Main async pipeline"""
-        start = time.time()
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         
-        output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True)
-        output_file = output_path / "prepared_data.json"
-        
-        # Init file
-        if output_file.exists():
-            output_file.unlink()
-        with open(output_file, 'w') as f:
+        with open(file_path, 'w', encoding='utf-8') as f:
             f.write('{\n  "rows": [\n')
         
-        logger.info("=== FIXED ASYNC PIPELINE ===")
-        
-        files = DocumentReader.find_files(Path(input_dir))
-        logger.info(f"Files: {len(files)}")
-        
-        if not files:
-            with open(output_file, 'a') as f:
-                f.write('\n  ]\n}\n')
+        logger.info(f"Initialized: {file_path}")
+
+    async def _append_to_json_async(self, chunks: List[Dict[str, Any]], file_path: Path, needs_comma: bool):
+        """Async JSON append"""
+        if not chunks:
             return
-        
-        total = 0
-        first_write = True
-        
-        for i, fp in enumerate(files):
-            logger.info(f"File {i+1}/{len(files)}: {fp.name}")
+
+        # Prepare JSON in memory
+        json_parts = []
+        for i, chunk in enumerate(chunks):
+            if needs_comma or i > 0:
+                json_parts.append(',\n')
             
-            try:
-                # Process file
-                chunk_dicts = await self._process_file_async(fp)
-                
-                if not chunk_dicts:
-                    continue
-                
-                logger.info(f"Chunks: {len(chunk_dicts)}")
-                
-                # Process in 300-chunk batches (larger!)
-                batch_size = 300
-                for j in range(0, len(chunk_dicts), batch_size):
-                    batch = chunk_dicts[j:j+batch_size]
-                    batch_num = j // batch_size + 1
-                    logger.info(f"Batch {batch_num}: {len(batch)} chunks")
-                    
-                    # Embed
-                    embedded = await self._embed_async(batch)
-                    
-                    # Write
-                    await self._write_async(embedded, output_file, first_write)
-                    first_write = False
-                    total += len(embedded)
-                    
-                    del batch, embedded
-                    gc.collect()
-                    await asyncio.sleep(0)
-                
-                del chunk_dicts
-                gc.collect()
-                
-            except Exception as e:
-                logger.error(f"Error: {e}")
+            cleaned = {
+                "chunk_id": chunk.get("chunk_id", f"unknown_{i}"),
+                "doc_id": chunk.get("doc_id", ""),
+                "chunk_index": chunk.get("chunk_index", i),
+                "chunk_text": chunk.get("chunk_text", ""),
+                "chunk_size": chunk.get("chunk_size", 0),
+                "chunk_tokens": chunk.get("chunk_tokens", 0),
+                "chunk_method": chunk.get("chunk_method", "recursive"),
+                "chunk_overlap": chunk.get("chunk_overlap", 0),
+                "domain": chunk.get("domain", "general"),
+                "content_type": chunk.get("content_type", "text"),
+                "embedding_model": chunk.get("embedding_model", ""),
+                "created_at": chunk.get("created_at", ""),
+                "embedding": chunk.get("embedding", [])
+            }
+            
+            if not isinstance(cleaned["embedding"], list) or len(cleaned["embedding"]) == 0:
                 continue
-        
-        # Finalize
-        with open(output_file, 'a') as f:
+            
+            chunk_str = json.dumps(cleaned, ensure_ascii=False)
+            json_parts.append('    ' + chunk_str.replace('\n', '\n    '))
+
+        # Write to file in thread pool
+        content = ''.join(json_parts)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            self.executor,
+            self._write_to_file,
+            file_path,
+            content
+        )
+
+    def _write_to_file(self, file_path: Path, content: str):
+        """Sync file write"""
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+
+    def _finalize_json_file(self, file_path: Path):
+        """Finalize JSON file"""
+        with open(file_path, 'a', encoding='utf-8') as f:
             f.write('\n  ]\n}\n')
         
-        logger.info(f"Total: {total} chunks")
+        # Quick validation
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-        # Import
-        if bulk_import and total > 0:
-            try:
-                logger.info("Importing...")
-                imp = EnhancedMilvusBulkImporter()
-                obj = imp.upload_to_minio(output_file)
-                imp.run_bulk_import("rag_chunks", obj)
-            except Exception as e:
-                logger.error(f"Import failed: {e}")
-        
-        elapsed = time.time() - start
-        logger.info(f"=== DONE in {elapsed:.2f}s ===")
-        logger.info(f"Speed: {total/elapsed:.1f} chunks/sec")
-        
-        # Cleanup
-        self.pool.close()
-        self.pool.join()
+        rows = data.get("rows", [])
+        logger.info(f"Finalized: {len(rows)} rows")
 
-    def __del__(self):
-        """Cleanup pool on deletion"""
-        if hasattr(self, 'pool'):
-            self.pool.close()
-            self.pool.join()
+    async def _process_file_async(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Async file processing"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self._process_file_sync,
+            file_path
+        )
+
+    def _process_file_sync(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Sync file processing"""
+        try:
+            document = DocumentReader.read_file(file_path)
+            if not document:
+                return []
+            chunks = OptimizedChunkingService.chunk_document(document, self.config)
+            return [chunk.model_dump(by_alias=False) for chunk in chunks]
+        except Exception as e:
+            logger.error(f"Error processing {file_path.name}: {e}")
+            return []
+
+    async def process_pipeline(
+        self, 
+        input_dir: str, 
+        output_dir: str,
+        use_bulk_import: bool = True
+    ):
+        """Main pipeline"""
+        
+        pipeline_start = time.time()
+        input_path = Path(input_dir)
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        
+        output_file = output_path / "prepared_data.json"
+        
+        try:
+            self._initialize_json_file(output_file)
+            logger.info("=== STARTING OPTIMIZED CPU PIPELINE ===")
+            
+            # Find files
+            files = DocumentReader.find_files(input_path)
+            logger.info(f"Found {len(files)} files")
+            
+            if not files:
+                self._finalize_json_file(output_file)
+                return
+            
+            total_chunks = 0
+            
+            # Process each file
+            for i, file_path in enumerate(files):
+                file_start = time.time()
+                logger.info(f"[{i+1}/{len(files)}] Processing: {file_path.name}")
+                
+                try:
+                    # Read and chunk
+                    chunk_dicts = await self._process_file_async(file_path)
+                    
+                    if not chunk_dicts:
+                        logger.warning(f"No chunks: {file_path.name}")
+                        continue
+                    
+                    logger.info(f"Generated {len(chunk_dicts)} chunks")
+                    
+                    # Process in batches
+                    for batch_idx in range(0, len(chunk_dicts), self.write_batch_size):
+                        batch_end = min(batch_idx + self.write_batch_size, len(chunk_dicts))
+                        batch = chunk_dicts[batch_idx:batch_end]
+                        
+                        batch_num = batch_idx // self.write_batch_size + 1
+                        total_batches = (len(chunk_dicts) + self.write_batch_size - 1) // self.write_batch_size
+                        logger.info(f"Batch {batch_num}/{total_batches}: {len(batch)} chunks")
+                        
+                        # Embed
+                        embedded = await self._embed_chunks_async(batch)
+                        
+                        # Write
+                        await self._append_to_json_async(
+                            embedded,
+                            output_file,
+                            total_chunks > 0
+                        )
+                        
+                        total_chunks += len(embedded)
+                        
+                        # Thermal management: brief pause every 3 batches
+                        if batch_num % 3 == 0:
+                            await asyncio.sleep(0.3)
+                        else:
+                            await asyncio.sleep(0)
+                        
+                        gc.collect()
+                    
+                    file_time = time.time() - file_start
+                    logger.info(f"Completed {file_path.name} in {file_time:.2f}s")
+                    
+                except Exception as e:
+                    logger.error(f"Error: {e}", exc_info=True)
+                    continue
+            
+            # Finalize
+            self._finalize_json_file(output_file)
+            logger.info(f"Total chunks processed: {total_chunks}")
+            
+            # Bulk import
+            if use_bulk_import and total_chunks > 0:
+                logger.info("Starting bulk import...")
+                try:
+                    importer = EnhancedMilvusBulkImporter()
+                    object_name = importer.upload_to_minio(output_file)
+                    importer.run_bulk_import("rag_chunks", object_name)
+                except Exception as e:
+                    logger.error(f"Bulk import failed: {e}", exc_info=True)
+            
+            total_time = time.time() - pipeline_start
+            logger.info("=== PIPELINE COMPLETED ===")
+            logger.info(f"Total time: {total_time:.2f}s")
+            if total_chunks > 0:
+                logger.info(f"Average speed: {total_chunks/total_time:.1f} chunks/sec")
+                
+        except Exception as e:
+            logger.error(f"Critical error: {e}", exc_info=True)
+            try:
+                self._finalize_json_file(output_file)
+            except:
+                pass
+            raise
+        finally:
+            self.executor.shutdown(wait=True)
 
 
 async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser = argparse.ArgumentParser(description="Final optimized CPU pipeline")
+    parser.add_argument("--input-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--chunk-overlap", type=int, default=256)
     parser.add_argument("--no-bulk-import", action="store_true")
@@ -261,14 +312,13 @@ async def main():
         chunk_overlap=args.chunk_overlap
     )
     
-    pipeline = FixedAsyncPipeline(config)
-    await pipeline.run_async(
-        args.input_dir,
-        args.output_dir,
-        not args.no_bulk_import
+    pipeline = FinalOptimizedPipeline(config)
+    await pipeline.process_pipeline(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        use_bulk_import=not args.no_bulk_import
     )
 
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
-    asyncio.run(main())
+    asyncio.run(main()) 

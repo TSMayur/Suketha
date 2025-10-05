@@ -8,7 +8,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from typing import List, Dict, Any
 from project.pydantic_models import Chunk, Document, SearchResult
 import logging
-
+import torch
+import sys
 logger = logging.getLogger(__name__)
 
 class OptimizedMilvusVectorStore:
@@ -61,7 +62,7 @@ class OptimizedMilvusVectorStore:
                 connection_args=connection_args,
                 consistency_level="Eventually",
                 drop_old=False,
-                vector_field="embedding_vector",
+                vector_field="embedding",
                 text_field="chunk_text",
                 enable_dynamic_field=True,
                 index_params={
@@ -70,6 +71,9 @@ class OptimizedMilvusVectorStore:
                     "params": {"nlist": 128}
                 }
             )
+            logger.info(f"Explicitly loading collection '{class_name}' into memory...")
+            cls._vectorstore.col.load()
+            logger.info("Collection loaded successfully.")
             logger.info(f"Collection '{class_name}' ready")
         except Exception as e:
             logger.error(f"Error setting up Milvus schema: {e}")
