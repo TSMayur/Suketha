@@ -88,6 +88,7 @@ submission_files/
 logs/
 models/
 outputs/
+submissions/
 
 
 Ignore database files and other large output files
