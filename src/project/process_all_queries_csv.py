@@ -3,6 +3,7 @@
 import json
 import zipfile
 import logging
+import csv
 from pathlib import Path
 from typing import List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,9 +13,10 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 
 # --- CONFIGURATION ---
-QUERIES_FILE = 'Queries.json'
+QUERIES_FILE = '1.json'
 OUTPUT_DIR = 'submission'
-ZIP_FILENAME = 'PS04_YOUR_TEAM_NAME.zip'
+ZIP_FILENAME = 'csv_too.zip'
+CSV_OUTPUT = 'search_results_with_scores.csv'  # NEW
 
 # Milvus Configuration - LOCAL
 MILVUS_URI = "http://localhost:19530"
@@ -49,6 +51,9 @@ class OptimizedBatchQueryProcessor:
         
         self._connect_to_milvus()
         
+        # NEW: Initialize CSV storage
+        self.csv_data = []
+        
         logger.info("Initialization complete")
     
     def _connect_to_milvus(self, max_retries=5, retry_delay=3):
@@ -61,7 +66,6 @@ class OptimizedBatchQueryProcessor:
                 else:
                     self.client = MilvusClient(uri=MILVUS_URI)
 
-                # Create the 'default' connection that the Collection class needs.
                 connections.connect("default", uri=MILVUS_URI)
                 
                 if not self.client.has_collection(COLLECTION_NAME):
@@ -147,30 +151,47 @@ class OptimizedBatchQueryProcessor:
                 limit=5,
                 search_params=search_params,
                 anns_field="embedding",
-                # --- CHANGE #1: ASK FOR THE CHUNK TEXT ---
-                output_fields=["doc_id", "chunk_text"] 
+                output_fields=["doc_id", "chunk_text", "chunk_id"]  # Get more fields
             )
             
             doc_ids = []
             seen = set()
-            # --- CHANGE #2: GRAB THE TEXT OF THE TOP CHUNK ---
-            top_chunk_text = "Not found." 
+            top_chunk_text = "Not found."
+            
+            # NEW: Store detailed results for CSV
+            detailed_results = []
             
             if results and len(results) > 0 and len(results[0]) > 0:
-                # Get the top chunk text from the very first result
                 top_chunk_text = results[0][0]['entity'].get('chunk_text', 'Text field missing.')
 
-                for hit in results[0]:
+                for rank, hit in enumerate(results[0], 1):
                     doc_id = hit['entity'].get('doc_id', '')
+                    chunk_id = hit['entity'].get('chunk_id', '')
+                    chunk_text = hit['entity'].get('chunk_text', '')
+                    
+                    # Get similarity score (distance in Milvus is 1 - cosine_similarity for COSINE metric)
+                    distance = hit.get('distance', 0.0)
+                    cosine_similarity = distance  # For COSINE metric, distance IS the similarity
+                    
                     if doc_id and doc_id not in seen:
                         doc_ids.append(doc_id)
                         seen.add(doc_id)
+                    
+                    # NEW: Store for CSV
+                    detailed_results.append({
+                        'rank': rank,
+                        'chunk_id': chunk_id,
+                        'doc_id': doc_id,
+                        'cosine_similarity': cosine_similarity,
+                        'chunk_text': chunk_text
+                    })
             
             return {
                 "query_num": query_num,
                 "query_text": query_text,
                 "doc_ids": doc_ids,
-                "top_chunk_text": top_chunk_text, # Pass the text along
+                "top_chunk_text": top_chunk_text,
+                "detailed_results": detailed_results,  # NEW
                 "success": True
             }
             
@@ -181,6 +202,7 @@ class OptimizedBatchQueryProcessor:
                 "query_text": query_text,
                 "doc_ids": [],
                 "top_chunk_text": f"Error during search: {e}",
+                "detailed_results": [],  # NEW
                 "success": False,
                 "error": str(e)
             }
@@ -201,11 +223,21 @@ class OptimizedBatchQueryProcessor:
                     result = future.result()
                     results.append(result)
                     
-                    # --- CHANGE #3: PRINT THE QUERY AND TOP RESULT ---
                     logger.info(f"\n[RESULT FOR QUERY #{result['query_num']}]")
                     logger.info(f"  QUERY: {result['query_text']}")
-                    # Truncate the chunk text to keep the log clean
-                    logger.info(f"  TOP CHUNK: {result['top_chunk_text'][:400]}...") 
+                    logger.info(f"  TOP CHUNK: {result['top_chunk_text'][:400]}...")
+                    
+                    # NEW: Store in CSV data
+                    for detail in result.get('detailed_results', []):
+                        self.csv_data.append({
+                            'query_num': result['query_num'],
+                            'query_text': result['query_text'],
+                            'rank': detail['rank'],
+                            'chunk_id': detail['chunk_id'],
+                            'doc_id': detail['doc_id'],
+                            'cosine_similarity': detail['cosine_similarity'],
+                            'chunk_text': detail['chunk_text'][:500]  # Truncate for CSV
+                        })
                     
                 except Exception as e:
                     query_num = future_to_query[future]
@@ -217,8 +249,6 @@ class OptimizedBatchQueryProcessor:
         
         return results
     
-    # ... (The rest of the file remains exactly the same) ...
-
     def write_result_file(self, result: Dict, output_path: Path) -> bool:
         try:
             output_data = {
@@ -254,6 +284,25 @@ class OptimizedBatchQueryProcessor:
         logger.info(f"Wrote {success_count}/{len(results)} files in {duration:.2f}s")
         
         return success_count
+    
+    def write_csv_results(self):
+        """NEW: Write all search results to CSV"""
+        logger.info(f"Writing CSV results to {CSV_OUTPUT}...")
+        
+        try:
+            with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'query_num', 'query_text', 'rank', 'chunk_id', 
+                    'doc_id', 'cosine_similarity', 'chunk_text'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                writer.writerows(self.csv_data)
+            
+            logger.info(f"✅ CSV written successfully: {len(self.csv_data)} rows")
+        except Exception as e:
+            logger.error(f"Failed to write CSV: {e}")
     
     def process_all_queries(self):
         start_time = time.time()
@@ -303,6 +352,9 @@ class OptimizedBatchQueryProcessor:
             logger.info(f"Progress: {processed}/{total_queries} ({100*processed/total_queries:.1f}%)")
             logger.info(f"Speed: {speed:.1f} queries/sec | ETA: {eta/60:.1f} minutes")
         
+        # NEW: Write CSV before creating zip
+        self.write_csv_results()
+        
         logger.info(f"\nCreating submission zip: {ZIP_FILENAME}")
         json_files = list(output_path.glob("*.json"))
         
@@ -318,6 +370,7 @@ class OptimizedBatchQueryProcessor:
         logger.info(f"Total time: {total_time/60:.2f} minutes")
         logger.info(f"Average speed: {total_queries/total_time:.1f} queries/sec")
         logger.info(f"Output: {ZIP_FILENAME}")
+        logger.info(f"CSV Output: {CSV_OUTPUT}")
         logger.info(f"{'='*60}")
 
 def run_batch_queries():
