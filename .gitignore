@@ -104,3 +104,15 @@ Ignore database files and other large output files
 *.pkl
 *.model
 *.bin   
+*.zip
+*.tar.gz
+*.tar
+*.h5
+*.hdf5
+*.ckpt
+
+
+# Custom ignores can be added below
+
+# End of .gitignore
+# ------------------------------------------------------------------------------
