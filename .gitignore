@@ -89,7 +89,8 @@ logs/
 models/
 outputs/
 submissions/
-
+PS04_YOUR_TEAM_NAME.zip
+PS04_YOUR_TEAM_NAME/
 
 Ignore database files and other large output files
 *.db
