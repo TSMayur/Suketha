@@ -1,4 +1,10 @@
 # src/project/chunker_optimized.py
+"""
+chunker.py
+
+- ChunkingService: Use for file-type-driven chunking (for most practical workflows)
+- OptimizedChunkingService: Use for legacy/research or domain-driven chunking
+"""
 
 import logging
 import json
@@ -12,10 +18,16 @@ from langchain.text_splitter import (
     NLTKTextSplitter,
     SpacyTextSplitter,
     MarkdownHeaderTextSplitter,
+    SentenceTransformersTokenTextSplitter,
     HTMLHeaderTextSplitter,
     TokenTextSplitter,
     CharacterTextSplitter
 )
+
+
+import pandas as pd
+import io
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -305,4 +317,242 @@ class OptimizedChunkingService:
                     embedding=None
                 )
                 chunks.append(chunk)
+        return chunks
+    
+    
+
+#filetype based chunking 
+
+class ChunkingService:
+    """LangChain-based chunking service with method toggle"""
+    
+    @staticmethod
+    def chunk_document(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        print(f"Chunking with method: {config.chunking_method.value}")
+        
+        if document.document_type.value in ("csv", "tsv", "tsv#"):
+            chunks = ChunkingService._csv_tsv_chunking(document, config)
+        elif document.document_type.value == "json":
+            chunks = ChunkingService._json_chunking(document, config)
+        elif config.chunking_method == ChunkingMethod.RECURSIVE:
+            chunks = ChunkingService._recursive_chunking(document, config)
+        elif config.chunking_method == ChunkingMethod.CHARACTER:
+            chunks = ChunkingService._character_chunking(document, config)
+        elif config.chunking_method == ChunkingMethod.TOKEN:
+            chunks = ChunkingService._token_chunking(document, config)
+        elif config.chunking_method == ChunkingMethod.SENTENCE:
+            chunks = ChunkingService._sentence_chunking(document, config)
+        else:
+            raise ValueError(f"Unknown chunking method: {config.chunking_method}")
+        
+        print(f"Created {len(chunks)} chunks")
+        return chunks
+    
+    @staticmethod
+    def _csv_tsv_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        sep = "," if document.document_type.value == "csv" else "\t"
+        has_header = False
+        
+        if has_header:
+            df = pd.read_csv(io.StringIO(document.content), sep=sep)
+        else:
+            df = pd.read_csv(io.StringIO(document.content), sep=sep, header=None)
+            df.columns = [f"Column{i+1}" for i in range(df.shape[1])]
+        
+        max_kb = 2
+        max_bytes = (max_kb * 1024) if max_kb else 4096
+        chunks = []
+        current_rows = []
+        running_len = 0
+        start_idx = 0
+        
+        for i, row in df.iterrows():
+            row_dict = {str(col): str(row[col]) for col in df.columns}
+            row_text = json.dumps(row_dict, ensure_ascii=False)
+            row_byte_len = len(row_text.encode("utf-8"))
+            
+            if running_len + row_byte_len > max_bytes and current_rows:
+                chunk_text = json.dumps(current_rows, ensure_ascii=False)
+                chunk = Chunk(
+                    doc_name=document.title,  # ADDED: File name
+                    id=f"{document.id}_chunk_{start_idx}",
+                    doc_id=document.id,
+                    content=chunk_text,
+                    chunk_index=start_idx,
+                    chunking_method=ChunkingMethod.RECURSIVE,
+                    metadata={
+                        "document_title": document.title,
+                        "document_type": document.document_type.value,
+                        "columns": list(df.columns),
+                        "row_start": start_idx,
+                        "row_end": i - 1,
+                    },
+                    chunk_overlap=config.chunk_overlap,
+                    start_position=0,
+                    end_position=len(chunk_text),
+                    vector_id=f"{document.id}_chunk_{start_idx}",
+                    content_type=document.document_type.value
+                )
+                chunks.append(chunk)
+                current_rows = []
+                running_len = 0
+                start_idx = i
+            
+            current_rows.append(row_dict)
+            running_len += row_byte_len
+        
+        if current_rows:
+            chunk_text = json.dumps(current_rows, ensure_ascii=False)
+            chunk = Chunk(
+                doc_name=document.title,  # ADDED: File name
+                id=f"{document.id}_chunk_{start_idx}",
+                doc_id=document.id,
+                content=chunk_text,
+                chunk_index=start_idx,
+                chunking_method=ChunkingMethod.RECURSIVE,
+                metadata={
+                    "document_title": document.title,
+                    "document_type": document.document_type.value,
+                    "columns": list(df.columns),
+                    "row_start": start_idx,
+                    "row_end": start_idx + len(current_rows) - 1,
+                },
+                chunk_overlap=config.chunk_overlap,
+                start_position=0,
+                end_position=len(chunk_text),
+                vector_id=f"{document.id}_chunk_{start_idx}",
+                content_type=document.document_type.value
+            )
+            chunks.append(chunk)
+        
+        return chunks
+    
+    @staticmethod
+    def _json_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        try:
+            splitter = RecursiveJsonSplitter(max_chunk_size=config.chunk_size)
+            splits = splitter.split_text(document.content)
+            texts = [split['text'] for split in splits]
+            metas = [split.get('metadata', {}) for split in splits]
+            chunks = ChunkingService._create_chunks_json(texts, metas, document, config)
+            return chunks
+        except Exception as e:
+            print(f"JSON splitter failed: {e}, using fallback.")
+            return ChunkingService._recursive_chunking(document, config)
+    
+    @staticmethod
+    def _recursive_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        texts = splitter.split_text(document.content)
+        chunks = ChunkingService._create_chunks_with_positions(texts, document, config)
+        return chunks
+    
+    @staticmethod
+    def _character_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        splitter = CharacterTextSplitter(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            separator="\n\n"
+        )
+        texts = splitter.split_text(document.content)
+        chunks = ChunkingService._create_chunks_with_positions(texts, document, config)
+        return chunks
+    
+    @staticmethod
+    def _token_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        splitter = TokenTextSplitter(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap
+        )
+        texts = splitter.split_text(document.content)
+        chunks = ChunkingService._create_chunks_with_positions(texts, document, config)
+        return chunks
+    
+    @staticmethod
+    def _sentence_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
+        splitter = SentenceTransformersTokenTextSplitter(
+            chunk_overlap=config.chunk_overlap,
+            tokens_per_chunk=config.chunk_size
+        )
+        texts = splitter.split_text(document.content)
+        chunks = ChunkingService._create_chunks_with_positions(texts, document, config)
+        return chunks
+    
+    @staticmethod
+    def _create_chunks_with_positions(texts: List[str], document: Document, config: ProcessingConfig) -> List[Chunk]:
+        chunks = []
+        current_position = 0
+        
+        for i, text in enumerate(texts):
+            if len(text.strip()) >= 20:
+                # Calculate actual positions
+                start_pos = document.content.find(text.strip(), current_position)
+                if start_pos == -1:  # Fallback if exact match not found
+                    start_pos = current_position
+                end_pos = start_pos + len(text.strip())
+                
+                chunk = Chunk(
+                    doc_name=document.title,  # ADDED: File name
+                    id=f"{document.id}_chunk_{i}",
+                    doc_id=document.id,
+                    content=text.strip(),
+                    chunk_index=i,
+                    chunking_method=config.chunking_method,
+                    metadata={
+                        "document_title": document.title,
+                        "document_type": document.document_type.value,
+                        "chunk_size": len(text),
+                        "word_count": len(text.split())
+                    },
+                    chunk_overlap=config.chunk_overlap,
+                    start_position=start_pos,
+                    end_position=end_pos,
+                    vector_id=f"{document.id}_chunk_{i}",
+                    content_type=document.document_type.value
+                )
+                chunks.append(chunk)
+                current_position = end_pos
+        
+        return chunks
+    
+    @staticmethod
+    def _create_chunks_json(texts: List[str], metas: List[dict], document: Document, config: ProcessingConfig) -> List[Chunk]:
+        chunks = []
+        current_position = 0
+        
+        for i, (text, meta) in enumerate(zip(texts, metas)):
+            if len(text.strip()) >= 20:
+                start_pos = current_position
+                end_pos = start_pos + len(text.strip())
+                
+                chunk_meta = {
+                    "document_title": document.title,
+                    "document_type": document.document_type.value,
+                    "chunk_size": len(text),
+                    "word_count": len(text.split()),
+                    "json_path": meta.get('path', []),
+                    **meta
+                }
+                
+                chunk = Chunk(
+                    doc_name=document.title,  # ADDED: File name
+                    id=f"{document.id}_chunk_{i}",
+                    doc_id=document.id,
+                    content=text.strip(),
+                    chunk_index=i,
+                    chunking_method=config.chunking_method,
+                    metadata=chunk_meta,
+                    chunk_overlap=config.chunk_overlap,
+                    start_position=start_pos,
+                    end_position=end_pos,
+                    vector_id=f"{document.id}_chunk_{i}",
+                    content_type=document.document_type.value
+                )
+                chunks.append(chunk)
+                current_position = end_pos
+        
         return chunks
