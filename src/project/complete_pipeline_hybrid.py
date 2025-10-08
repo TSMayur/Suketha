@@ -148,6 +148,7 @@ class FinalOptimizedPipeline:
             cleaned = {
                 "chunk_id": chunk.get("chunk_id", f"unknown_{i}"),
                 "doc_id": chunk.get("doc_id", ""),
+                "doc_name": chunk.get("doc_name", ""),
                 "chunk_index": chunk.get("chunk_index", i),
                 "chunk_text": chunk.get("chunk_text", ""),
                 "chunk_size": chunk.get("chunk_size", 0),
@@ -325,7 +326,7 @@ class FinalOptimizedPipeline:
                 try:
                     importer = EnhancedMilvusBulkImporter()
                     object_name = importer.upload_to_minio(output_file)
-                    importer.run_bulk_import("rag_chunks", object_name)
+                    importer.run_bulk_import("rag_chunks_test1", object_name)
                 except Exception as e:
                     logger.error(f"Bulk import failed: {e}", exc_info=True)
             

@@ -1,6 +1,6 @@
 from pymilvus import MilvusClient, DataType
 
-COLLECTION_NAME = "rag_chunks"
+COLLECTION_NAME = "rag_chunks_test1"
 
 def create_collection():
     client = MilvusClient(uri="http://localhost:19530")
@@ -14,6 +14,7 @@ def create_collection():
     # --- Fields that are ACTUALLY CREATED by the pipeline ---
     schema.add_field("chunk_id", DataType.VARCHAR, max_length=255, is_primary=True)
     schema.add_field("doc_id", DataType.VARCHAR, max_length=255)
+    schema.add_field("doc_name", DataType.VARCHAR, max_length=255) # Added this line
     schema.add_field("chunk_index", DataType.INT64)
     schema.add_field("chunk_text", DataType.VARCHAR, max_length=65535)
     schema.add_field("chunk_size", DataType.INT64)

@@ -8,6 +8,7 @@ def create_sqlite_db(db_path="rag_chunks.db"):
     cur.execute("""
     CREATE TABLE IF NOT EXISTS documents (
         doc_id TEXT PRIMARY KEY,
+        doc_name TEXT NOT NULL,
         source_path TEXT NOT NULL,
         filename TEXT NOT NULL,
         file_extension TEXT NOT NULL,
@@ -35,6 +36,7 @@ def create_sqlite_db(db_path="rag_chunks.db"):
     CREATE TABLE IF NOT EXISTS chunks (
         chunk_id TEXT PRIMARY KEY,
         doc_id TEXT NOT NULL,
+        doc_name TEXT NOT NULL,
         chunk_index INTEGER NOT NULL,
         chunk_text TEXT NOT NULL,
         chunk_size INTEGER NOT NULL,

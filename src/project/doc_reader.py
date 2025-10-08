@@ -46,22 +46,21 @@ class DocumentReader:
                 with open(file_path, "rb") as f:
                     pdf_reader = pypdf.PdfReader(f)
                     content = "\n".join([page.extract_text() for page in pdf_reader.pages])
-            elif doc_type in [DocumentType.TXT, DocumentType.JSON]:
+            elif doc_type in [DocumentType.TXT, DocumentType.JSON, DocumentType.CSV, DocumentType.TSV]:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
             elif doc_type == DocumentType.DOCX:
                 doc = docx.Document(file_path)
                 content = "\n".join([para.text for para in doc.paragraphs])
-            elif doc_type in [DocumentType.CSV, DocumentType.TSV]:
-                df = pd.read_csv(file_path, sep=',' if doc_type == DocumentType.CSV else '\t')
-                content = df.to_string()
 
             return Document(
                 id=doc_id,
+                doc_name=file_path.name,
                 content=content,
                 document_type=doc_type,
                 metadata=metadata,
-                source=str(file_path)
+                source=str(file_path),
+                title=file_path.name
             )
         except Exception as e:
             logger.error(f"Error reading {file_path}: {e}")

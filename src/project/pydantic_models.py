@@ -1,4 +1,4 @@
-# src/project/pydantic_models_complete.py
+# src/project/pydantic_models.py
 
 from pydantic import BaseModel, Field, field_serializer
 from typing import List, Optional, Dict, Any
@@ -20,6 +20,9 @@ class ChunkingMethod(str, Enum):
     NLTK = "nltk"
     MARKDOWN = "markdown_header"
     COMBINED = "combined"
+    CHARACTER = "character"
+    TOKEN = "token"
+    SENTENCE = "sentence"
 
 class EmbeddingModel(str, Enum):
     ALL_MPNET_BASE_V2 = "sentence-transformers/all-mpnet-base-v2"
@@ -27,6 +30,7 @@ class EmbeddingModel(str, Enum):
 class Document(BaseModel):
     id: str
     content: str
+    title: str
     document_type: DocumentType
     metadata: Dict[str, Any] = Field(default_factory=dict)
     source: str
@@ -34,8 +38,9 @@ class Document(BaseModel):
 class Chunk(BaseModel):
     chunk_id: str = Field(..., alias="id")
     doc_id: str
+    doc_name: str
     chunk_index: int
-    chunk_text: str
+    chunk_text: str 
     chunk_size: int
     chunk_tokens: int
     chunk_method: ChunkingMethod

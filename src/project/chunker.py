@@ -305,6 +305,7 @@ class OptimizedChunkingService:
                 chunk = Chunk(
                     id=f"{document.id}_chunk_{i}",
                     doc_id=document.id,
+                    doc_name=document.title,
                     chunk_text=text.strip(),
                     chunk_index=i,
                     chunk_method=ChunkingMethod.RECURSIVE,
@@ -330,9 +331,9 @@ class ChunkingService:
     def chunk_document(document: Document, config: ProcessingConfig) -> List[Chunk]:
         print(f"Chunking with method: {config.chunking_method.value}")
         
-        if document.document_type.value in ("csv", "tsv", "tsv#"):
+        if document.document_type in (DocumentType.CSV, DocumentType.TSV):
             chunks = ChunkingService._csv_tsv_chunking(document, config)
-        elif document.document_type.value == "json":
+        elif document.document_type == DocumentType.JSON:
             chunks = ChunkingService._json_chunking(document, config)
         elif config.chunking_method == ChunkingMethod.RECURSIVE:
             chunks = ChunkingService._recursive_chunking(document, config)
@@ -350,14 +351,14 @@ class ChunkingService:
     
     @staticmethod
     def _csv_tsv_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
-        sep = "," if document.document_type.value == "csv" else "\t"
-        has_header = False
+        sep = "," if document.document_type == DocumentType.CSV else "\t"
         
-        if has_header:
-            df = pd.read_csv(io.StringIO(document.content), sep=sep)
-        else:
+        try:
             df = pd.read_csv(io.StringIO(document.content), sep=sep, header=None)
             df.columns = [f"Column{i+1}" for i in range(df.shape[1])]
+        except Exception as e:
+            logger.error(f"Error parsing CSV/TSV file: {e}")
+            return []
         
         max_kb = 2
         max_bytes = (max_kb * 1024) if max_kb else 4096
@@ -374,24 +375,17 @@ class ChunkingService:
             if running_len + row_byte_len > max_bytes and current_rows:
                 chunk_text = json.dumps(current_rows, ensure_ascii=False)
                 chunk = Chunk(
-                    doc_name=document.title,  # ADDED: File name
+                    doc_name=document.title,
                     id=f"{document.id}_chunk_{start_idx}",
                     doc_id=document.id,
-                    content=chunk_text,
+                    doc_name=document.title,
+                    chunk_text=chunk_text,
                     chunk_index=start_idx,
-                    chunking_method=ChunkingMethod.RECURSIVE,
-                    metadata={
-                        "document_title": document.title,
-                        "document_type": document.document_type.value,
-                        "columns": list(df.columns),
-                        "row_start": start_idx,
-                        "row_end": i - 1,
-                    },
+                    chunk_method=ChunkingMethod.RECURSIVE,
                     chunk_overlap=config.chunk_overlap,
-                    start_position=0,
-                    end_position=len(chunk_text),
-                    vector_id=f"{document.id}_chunk_{start_idx}",
-                    content_type=document.document_type.value
+                    content_type=document.document_type.value,
+                    chunk_size=len(chunk_text),
+                    chunk_tokens=0,
                 )
                 chunks.append(chunk)
                 current_rows = []
@@ -404,24 +398,17 @@ class ChunkingService:
         if current_rows:
             chunk_text = json.dumps(current_rows, ensure_ascii=False)
             chunk = Chunk(
-                doc_name=document.title,  # ADDED: File name
+                doc_name=document.title,
                 id=f"{document.id}_chunk_{start_idx}",
                 doc_id=document.id,
-                content=chunk_text,
+                doc_name=document.title,
+                chunk_text=chunk_text,
                 chunk_index=start_idx,
-                chunking_method=ChunkingMethod.RECURSIVE,
-                metadata={
-                    "document_title": document.title,
-                    "document_type": document.document_type.value,
-                    "columns": list(df.columns),
-                    "row_start": start_idx,
-                    "row_end": start_idx + len(current_rows) - 1,
-                },
+                chunk_method=ChunkingMethod.RECURSIVE,
                 chunk_overlap=config.chunk_overlap,
-                start_position=0,
-                end_position=len(chunk_text),
-                vector_id=f"{document.id}_chunk_{start_idx}",
-                content_type=document.document_type.value
+                content_type=document.document_type.value,
+                chunk_size=len(chunk_text),
+                chunk_tokens=0,
             )
             chunks.append(chunk)
         
@@ -431,9 +418,10 @@ class ChunkingService:
     def _json_chunking(document: Document, config: ProcessingConfig) -> List[Chunk]:
         try:
             splitter = RecursiveJsonSplitter(max_chunk_size=config.chunk_size)
-            splits = splitter.split_text(document.content)
-            texts = [split['text'] for split in splits]
-            metas = [split.get('metadata', {}) for split in splits]
+            json_content = json.loads(document.content)
+            splits = splitter.split_json(json_content)
+            texts = [json.dumps(s) for s in splits]
+            metas = [s.get('metadata', {}) for s in splits]
             chunks = ChunkingService._create_chunks_json(texts, metas, document, config)
             return chunks
         except Exception as e:
@@ -496,23 +484,17 @@ class ChunkingService:
                 end_pos = start_pos + len(text.strip())
                 
                 chunk = Chunk(
-                    doc_name=document.title,  # ADDED: File name
+                    doc_name=document.title,
                     id=f"{document.id}_chunk_{i}",
                     doc_id=document.id,
-                    content=text.strip(),
+                    doc_name=document.title,
+                    chunk_text=text.strip(),
                     chunk_index=i,
-                    chunking_method=config.chunking_method,
-                    metadata={
-                        "document_title": document.title,
-                        "document_type": document.document_type.value,
-                        "chunk_size": len(text),
-                        "word_count": len(text.split())
-                    },
+                    chunk_method=config.chunking_method,
                     chunk_overlap=config.chunk_overlap,
-                    start_position=start_pos,
-                    end_position=end_pos,
-                    vector_id=f"{document.id}_chunk_{i}",
-                    content_type=document.document_type.value
+                    content_type=document.document_type.value,
+                    chunk_size=len(text.strip()),
+                    chunk_tokens=len(text.strip().split()),
                 )
                 chunks.append(chunk)
                 current_position = end_pos
@@ -528,29 +510,19 @@ class ChunkingService:
             if len(text.strip()) >= 20:
                 start_pos = current_position
                 end_pos = start_pos + len(text.strip())
-                
-                chunk_meta = {
-                    "document_title": document.title,
-                    "document_type": document.document_type.value,
-                    "chunk_size": len(text),
-                    "word_count": len(text.split()),
-                    "json_path": meta.get('path', []),
-                    **meta
-                }
-                
+
                 chunk = Chunk(
-                    doc_name=document.title,  # ADDED: File name
+                    doc_name=document.title,
                     id=f"{document.id}_chunk_{i}",
                     doc_id=document.id,
-                    content=text.strip(),
+                    doc_name=document.title,
+                    chunk_text=text.strip(),
                     chunk_index=i,
-                    chunking_method=config.chunking_method,
-                    metadata=chunk_meta,
+                    chunk_method=config.chunking_method,
                     chunk_overlap=config.chunk_overlap,
-                    start_position=start_pos,
-                    end_position=end_pos,
-                    vector_id=f"{document.id}_chunk_{i}",
-                    content_type=document.document_type.value
+                    content_type=document.document_type.value,
+                    chunk_size=len(text.strip()),
+                    chunk_tokens=len(text.strip().split()),
                 )
                 chunks.append(chunk)
                 current_position = end_pos

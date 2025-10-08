@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from pymilvus import MilvusClient, Collection, connections
 from sentence_transformers import SentenceTransformer
-import numpy as np
+import numpy as np 
 
 # --- CONFIGURATION ---
 QUERIES_FILE = 'Queries.json'
@@ -169,8 +169,8 @@ class OptimizedBatchQueryProcessor:
             return {
                 "query_num": query_num,
                 "query_text": query_text,
-                "doc_ids": doc_ids,
-                "top_chunk_text": top_chunk_text, # Pass the text along
+                "doc_ids": doc_ids,  
+                "top_chunk_text": top_chunk_text, 
                 "success": True
             }
             
