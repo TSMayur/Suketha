@@ -1,4 +1,15 @@
 # src/project/complete_pipeline_final.py
+# ------------------ INPUT FILE LOGIC HANDLING ------------------
+# This pipeline accepts input either via:
+# - An SQLite "documents.db" file in the input directory or 
+# db with different name(update the db name in below code line number:240 )
+# - OR if not found, defaults to scanning the input directory for files (legacy/manual workflows)
+#
+# For SQLite: The "documents" table must contain 'doc_id', 'source_path', and 'processing_status' fields.
+# Only rows with processing_status='pending' will be included.
+# The input_dir must contain the documents.db SQLite database if you want to use the DB-driven input.
+# --------------------------------------------------------------
+
 
 import argparse
 import asyncio
@@ -11,9 +22,11 @@ from pathlib import Path
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
+import sqlite3
+
 from project.pydantic_models import ProcessingConfig, EmbeddingModel
 from project.doc_reader import DocumentReader
-from project.chunker import OptimizedChunkingService
+from project.chunker import OptimizedChunkingService,ChunkingService
 from project.milvus_bulk_import import EnhancedMilvusBulkImporter
 from sentence_transformers import SentenceTransformer
 
@@ -23,6 +36,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+#new function added for sqlite
+def get_files_from_sqlite(db_path):
+    """
+    Get files from SQLite documents table with pending status,
+    returns a list of (doc_id, Path) tuples.
+    """
+    query = "SELECT doc_id, source_path FROM documents WHERE processing_status='pending'"
+    with sqlite3.connect(db_path) as conn:
+        files = []
+        for doc_id, source_path in conn.execute(query):
+            if os.path.exists(source_path):
+                files.append((doc_id, Path(source_path)))
+            else:
+                logger.warning(f"File not found: {source_path}")
+        return files
 
 class FinalOptimizedPipeline:
     """
@@ -180,7 +209,7 @@ class FinalOptimizedPipeline:
             document = DocumentReader.read_file(file_path)
             if not document:
                 return []
-            chunks = OptimizedChunkingService.chunk_document(document, self.config)
+            chunks = ChunkingService.chunk_document(document, self.config)
             return [chunk.model_dump(by_alias=False) for chunk in chunks]
         except Exception as e:
             logger.error(f"Error processing {file_path.name}: {e}")
@@ -206,8 +235,23 @@ class FinalOptimizedPipeline:
             logger.info("=== STARTING OPTIMIZED CPU PIPELINE ===")
             
             # Find files
-            files = DocumentReader.find_files(input_path)
-            logger.info(f"Found {len(files)} files")
+            #files = DocumentReader.find_files(input_path) 
+            # Try to fetch files from SQLite (if database exists)
+            db_path = input_path / "documents.db"
+            if db_path.exists():
+                logger.info(f"Fetching pending files from SQLite: {db_path}")
+                files = get_files_from_sqlite(str(db_path))
+                # get_files_from_sqlite returns list of (doc_id, Path)
+                files = [(doc_id, path) for doc_id, path in files]
+    
+            else:
+                logger.info("No SQLite DB found — scanning input directory instead.")
+                file_paths = DocumentReader.find_files(input_path)
+                # Wrap with dummy doc_ids (None)
+                files = [(None, path) for path in file_paths]
+
+            logger.info(f"Found {len(files)} files to process")
+
             
             if not files:
                 self._finalize_json_file(output_file)
@@ -216,13 +260,18 @@ class FinalOptimizedPipeline:
             total_chunks = 0
             
             # Process each file
-            for i, file_path in enumerate(files):
+            for i, (doc_id,file_path) in enumerate(files):
                 file_start = time.time()
-                logger.info(f"[{i+1}/{len(files)}] Processing: {file_path.name}")
+                logger.info(f"[{i+1}/{len(files)}] Processing: {file_path.name} (doc_id={doc_id})")
                 
                 try:
                     # Read and chunk
                     chunk_dicts = await self._process_file_async(file_path)
+                    # Attach doc_id (if from SQLite)
+                    if doc_id is not None:                        
+                        for chunk in chunk_dicts:                            
+                            chunk["doc_id"] = doc_id
+
                     
                     if not chunk_dicts:
                         logger.warning(f"No chunks: {file_path.name}")
