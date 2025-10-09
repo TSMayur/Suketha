@@ -1,6 +1,6 @@
 import sqlite3
 
-def create_sqlite_db(db_path="rag_chunks.db"):
+def create_sqlite_db(db_path="documents.db"):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 

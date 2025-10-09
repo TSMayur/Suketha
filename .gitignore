@@ -5,6 +5,7 @@ pycache/
 *.pyc
 *.pyo
 *.pyd
+*.db
 
 C extensions
 *.so
@@ -68,6 +69,7 @@ IDE / Editor specific
 .idea/
 *.swp
 *.swo
+*.db
 
 macOS
 ------------------------------------------------------------------------------

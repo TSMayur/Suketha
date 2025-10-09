@@ -28,6 +28,7 @@ from project.pydantic_models import ProcessingConfig, EmbeddingModel
 from project.doc_reader import DocumentReader
 from project.chunker import OptimizedChunkingService,ChunkingService
 from project.milvus_bulk_import import EnhancedMilvusBulkImporter
+from project.populate_sqlite_from_json import populate_db_from_json
 from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(
@@ -329,6 +330,11 @@ class FinalOptimizedPipeline:
                     importer.run_bulk_import("rag_chunks_test1", object_name)
                 except Exception as e:
                     logger.error(f"Bulk import failed: {e}", exc_info=True)
+
+            # Populate SQLite database from the generated JSON
+            if db_path.exists() and total_chunks > 0:
+                logger.info(f"Populating SQLite database: {db_path}")
+                populate_db_from_json(str(db_path), str(output_file))
             
             total_time = time.time() - pipeline_start
             logger.info("=== PIPELINE COMPLETED ===")
