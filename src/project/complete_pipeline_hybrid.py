@@ -327,7 +327,7 @@ class FinalOptimizedPipeline:
                 try:
                     importer = EnhancedMilvusBulkImporter()
                     object_name = importer.upload_to_minio(output_file)
-                    importer.run_bulk_import("rag_chunks_test1", object_name)
+                    importer.run_bulk_import("rag_chunks", object_name)
                 except Exception as e:
                     logger.error(f"Bulk import failed: {e}", exc_info=True)
 

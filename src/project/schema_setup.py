@@ -1,6 +1,6 @@
 from pymilvus import MilvusClient, DataType
 
-COLLECTION_NAME = "rag_chunks_test1"
+COLLECTION_NAME = "rag_chunks"
 
 def create_collection():
     client = MilvusClient(uri="http://localhost:19530")
