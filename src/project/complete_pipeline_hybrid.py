@@ -81,7 +81,7 @@ class FinalOptimizedPipeline:
         self.write_batch_size = 300      # Write in larger chunks
         
         # Thread pool for I/O operations only
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count())
         
         logger.info(f"Pipeline ready: batch_size={self.embedding_batch_size}")
 

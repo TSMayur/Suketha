@@ -12,7 +12,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np 
 
 # --- CONFIGURATION ---
-QUERIES_FILE = 'Queries.json'
+QUERIES_FILE = 'queries.json'
 OUTPUT_DIR = 'submission'
 ZIP_FILENAME = 'PS04_YOUR_TEAM_NAME.zip'
 
@@ -148,7 +148,7 @@ class OptimizedBatchQueryProcessor:
                 search_params=search_params,
                 anns_field="embedding",
                 # --- CHANGE #1: ASK FOR THE CHUNK TEXT ---
-                output_fields=["doc_id", "chunk_text"] 
+                output_fields=["doc_id","doc_name", "chunk_text"] 
             )
             
             doc_ids = []
@@ -161,7 +161,7 @@ class OptimizedBatchQueryProcessor:
                 top_chunk_text = results[0][0]['entity'].get('chunk_text', 'Text field missing.')
 
                 for hit in results[0]:
-                    doc_id = hit['entity'].get('doc_id', '')
+                    doc_id = hit['entity'].get('doc_name', '')
                     if doc_id and doc_id not in seen:
                         doc_ids.append(doc_id)
                         seen.add(doc_id)

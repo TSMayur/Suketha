@@ -3,12 +3,8 @@ import argparse
 import logging
 import time
 import uuid
-import threading
-import queue
-import json
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, List, Iterable, Dict, Any
+from typing import Optional, List
 from fnmatch import fnmatch
 
 import aiosqlite
@@ -34,7 +30,7 @@ class Document(BaseModel):
     doc_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source_path: str
     filename: str
-    doc_name: str  # <--- ADDED THIS LINE
+    doc_name: str
     file_extension: str
     header_exists: Optional[int] = None
     file_size: int
@@ -81,7 +77,7 @@ async def get_file_metadata(file_path: Path) -> Document:
     return Document(
         source_path=str(file_path.resolve()),
         filename=file_path.name,
-        doc_name=file_path.name,  # <--- AND ADDED THIS LINE
+        doc_name=file_path.name,
         file_extension=file_extension,
         header_exists=header_exists,
         file_size=file_size,
@@ -109,8 +105,7 @@ async def insert_batch(db: aiosqlite.Connection, batch: List[Document]):
     try:
         await db.executemany(sql, params)
     except Exception as e:
-        for doc in batch:
-            logging.error(f"Failed to insert {doc.filename}: {e}")
+        logging.error(f"Failed to insert a batch: {e}")
 
 async def process_folder(
     folder: str,
@@ -129,25 +124,34 @@ async def process_folder(
     ignore_patterns = get_ignore_patterns(Path(ignorefile)) if ignorefile else []
     
     semaphore = asyncio.Semaphore(max_concurrency)
+    lock = asyncio.Lock()
     batch: List[Document] = []
     total_rows = 0
     
     logging.info(f"Starting scan in '{folder}' (batch_size={batch_size}, max_concurrency={max_concurrency})")
 
     async def process_file(file_path: Path):
-        nonlocal total_rows
+        nonlocal total_rows, batch
         async with semaphore:
-            metadata = await get_file_metadata(file_path)
-            batch.append(metadata)
-            if len(batch) >= batch_size:
-                await insert_batch(db, batch)
-                total_rows += len(batch)
-                batch.clear()
-                if total_rows % commit_interval == 0:
-                    await db.commit()
-                if total_rows % progress_interval == 0:
-                    rate = total_rows / (time.time() - start_time)
-                    logging.info(f"Processed {total_rows} rows... ({rate:.2f} rows/s)")
+            try:
+                metadata = await get_file_metadata(file_path)
+                
+                async with lock:
+                    batch.append(metadata)
+                    if len(batch) >= batch_size:
+                        current_batch = list(batch)
+                        batch.clear()
+                        
+                        await insert_batch(db, current_batch)
+                        total_rows += len(current_batch)
+                        
+                        if total_rows % commit_interval == 0:
+                            await db.commit()
+                        if total_rows % progress_interval == 0:
+                            rate = total_rows / (time.time() - start_time)
+                            logging.info(f"Processed {total_rows} rows... ({rate:.2f} rows/s)")
+            except Exception as e:
+                logging.error(f"Failed to process file {file_path}: {e}")
 
     tasks = [
         process_file(p)
@@ -156,6 +160,7 @@ async def process_folder(
     ]
     await asyncio.gather(*tasks)
 
+    # Insert any remaining files in the final batch
     if batch:
         await insert_batch(db, batch)
         total_rows += len(batch)
@@ -165,7 +170,7 @@ async def process_folder(
     
     duration = time.time() - start_time
     rate = total_rows / duration if duration > 0 else 0
-    logging.info(f"Completed processing. Rows attempted: {total_rows}. Time: {duration:.2f}s. Rate: {rate:.2f} rows/s")
+    logging.info(f"Completed processing. Rows inserted: {total_rows}. Time: {duration:.2f}s. Rate: {rate:.2f} rows/s")
 
 
 def main():
@@ -173,10 +178,10 @@ def main():
     parser.add_argument("folder", help="Root folder to scan for files.")
     parser.add_argument("--db", default="file_metadata.db", help="Path to the SQLite database file.")
     parser.add_argument("--ignorefile", help="Path to a file with ignore patterns.")
-    parser.add_argument("--batch-size", type=int, default=20, help="Number of files to process in a batch.")
-    parser.add_argument("--max-concurrency", type=int, default=20, help="Maximum concurrent file processing tasks.")
-    parser.add_argument("--commit-interval", type=int, default=1000, help="Commit to DB every N rows.")
-    parser.add_argument("--progress-interval", type=int, default=500, help="Log progress every N rows.")
+    parser.add_argument("--batch-size", type=int, default=100, help="Number of files to process in a batch.")
+    parser.add_argument("--max-concurrency", type=int, default=50, help="Maximum concurrent file processing tasks.")
+    parser.add_argument("--commit-interval", type=int, default=2000, help="Commit to DB every N rows.")
+    parser.add_argument("--progress-interval", type=int, default=1000, help="Log progress every N rows.")
     args = parser.parse_args()
 
     asyncio.run(

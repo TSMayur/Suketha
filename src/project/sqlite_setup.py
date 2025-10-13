@@ -1,4 +1,5 @@
 import sqlite3
+import argparse
 
 def create_sqlite_db(db_path="documents.db"):
     conn = sqlite3.connect(db_path)
@@ -8,9 +9,9 @@ def create_sqlite_db(db_path="documents.db"):
     cur.execute("""
     CREATE TABLE IF NOT EXISTS documents (
         doc_id TEXT PRIMARY KEY,
-        doc_name TEXT NOT NULL,
         source_path TEXT NOT NULL,
         filename TEXT NOT NULL,
+        doc_name TEXT NOT NULL,
         file_extension TEXT NOT NULL,
         header_exists INTEGER,
         file_size INTEGER NOT NULL,
@@ -31,7 +32,7 @@ def create_sqlite_db(db_path="documents.db"):
     )
     """)
 
-    # Chunks Table (REMOVED document_title to match desired schema)
+    # Chunks Table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chunks (
         chunk_id TEXT PRIMARY KEY,
@@ -57,7 +58,10 @@ def create_sqlite_db(db_path="documents.db"):
 
     conn.commit()
     conn.close()
-    print("SQLite tables 'documents' and 'chunks' created successfully!")
+    print(f"SQLite tables in '{db_path}' created successfully!")
 
 if __name__ == "__main__":
-    create_sqlite_db()
+    parser = argparse.ArgumentParser(description="Create and set up the SQLite database.")
+    parser.add_argument("--db-path", default="documents.db", help="Path to the SQLite database file.")
+    args = parser.parse_args()
+    create_sqlite_db(args.db_path)
