@@ -1,15 +1,15 @@
-# src/project/complete_pipeline_final.py
-# ------------------ INPUT FILE LOGIC HANDLING ------------------
-# This pipeline accepts input either via:
-# - An SQLite "documents.db" file in the input directory or 
-# db with different name(update the db name in below code line number:240 )
-# - OR if not found, defaults to scanning the input directory for files (legacy/manual workflows)
-#
-# For SQLite: The "documents" table must contain 'doc_id', 'source_path', and 'processing_status' fields.
-# Only rows with processing_status='pending' will be included.
-# The input_dir must contain the documents.db SQLite database if you want to use the DB-driven input.
-# --------------------------------------------------------------
+# src/project/complete_pipeline_hybrid.py
+"""
+COMPLETE HYBRID PIPELINE with Milvus Native BM25
 
+Features:
+1. Dense vectors (sentence-transformers)
+2. Sparse vectors (Milvus BM25 - auto-generated)
+3. Chunk cleaning before embedding
+4. Hybrid search ready
+
+This replaces complete_pipeline_hybrid.py with full Milvus BM25 support.
+"""
 
 import argparse
 import asyncio
@@ -21,15 +21,17 @@ import gc
 from pathlib import Path
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-
 import sqlite3
+
+import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from pymilvus import MilvusClient
 
 from project.pydantic_models import ProcessingConfig, EmbeddingModel
 from project.doc_reader import DocumentReader
-from project.chunker import OptimizedChunkingService,ChunkingService
-from project.milvus_bulk_import import EnhancedMilvusBulkImporter
-from project.populate_sqlite_from_json import populate_db_from_json
-from sentence_transformers import SentenceTransformer
+from project.chunker import ChunkingService
+from project.chunk_cleaner import clean_chunks_before_embedding
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,13 +39,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Milvus configuration
+COLLECTION_NAME = "rag_chunks_hybrid"
 
-#new function added for sqlite
+
 def get_files_from_sqlite(db_path):
-    """
-    Get files from SQLite documents table with pending status,
-    returns a list of (doc_id, Path) tuples.
-    """
+    """Get files from SQLite with pending status"""
     query = "SELECT doc_id, source_path FROM documents WHERE processing_status='pending'"
     with sqlite3.connect(db_path) as conn:
         files = []
@@ -54,103 +55,166 @@ def get_files_from_sqlite(db_path):
                 logger.warning(f"File not found: {source_path}")
         return files
 
-class FinalOptimizedPipeline:
+
+class MilvusHybridPipeline:
     """
-    Final optimized pipeline for CPU:
-    - Model loaded ONCE at startup
-    - Large batches (128 chunks) for efficient processing
-    - Async I/O to overlap operations
-    - Thermal management with cooling breaks
-    - Minimal memory overhead
+    Complete pipeline with Milvus native hybrid search support
     """
     
     def __init__(self, config: ProcessingConfig):
         self.config = config
         
-        # Load model ONCE - this is the key optimization
-        logger.info("Loading embedding model (one-time operation)...")
-        start = time.time()
+        # Device setup
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        logger.info(f"Using device: {self.device}")
+        
+        # Load embedding model (for dense vectors)
+        logger.info("Loading sentence transformer for dense embeddings...")
         self.embedding_model = SentenceTransformer(
             EmbeddingModel.ALL_MPNET_BASE_V2.value,
-            device='cpu'
+            device=self.device
         )
-        logger.info(f"Model loaded in {time.time()-start:.2f}s")
         
-        # Optimal settings for CPU
-        self.embedding_batch_size = 128  # Sweet spot for CPU
-        self.write_batch_size = 300      # Write in larger chunks
+        # Batch sizes
+        if self.device == "mps":
+            self.embedding_batch_size = 32
+            self.chunk_batch_size = 200
+        else:
+            self.embedding_batch_size = 64
+            self.chunk_batch_size = 500
         
-        # Thread pool for I/O operations only
-        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count())
+        # Thread pool
+        self.executor = ThreadPoolExecutor(max_workers=2)
         
-        logger.info(f"Pipeline ready: batch_size={self.embedding_batch_size}")
-
-    def _embed_batch_sync(self, texts: List[str]) -> List[List[float]]:
-        """Synchronous embedding - model already loaded"""
-        embeddings = self.embedding_model.encode(
-            texts,
-            batch_size=self.embedding_batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        )
-        return embeddings.tolist()
-
-    async def _embed_chunks_async(self, chunk_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Async wrapper for embedding"""
-        if not chunk_dicts:
+        # Connect to Milvus
+        self._connect_to_milvus()
+        
+        logger.info("Pipeline initialized successfully")
+    
+    def _connect_to_milvus(self):
+        """Connect to Milvus"""
+        logger.info("Connecting to Milvus...")
+        self.milvus_client = MilvusClient(uri="http://localhost:19530")
+        
+        if not self.milvus_client.has_collection(COLLECTION_NAME):
+            logger.error(f"❌ Collection '{COLLECTION_NAME}' not found!")
+            logger.error("Run: poetry run python -m project.schema_setup_hybrid")
+            raise RuntimeError(f"Collection '{COLLECTION_NAME}' does not exist")
+        
+        logger.info(f"✅ Connected to Milvus collection: {COLLECTION_NAME}")
+    
+    def generate_sparse_vector(self, text: str) -> Dict[int, float]:
+        """
+        Generate BM25 sparse vector from text.
+        
+        Milvus BM25 uses a simple TF-IDF-like approach:
+        - Term frequencies become sparse vector indices
+        - Values are normalized scores
+        """
+        # Tokenize (simple whitespace + lowercase)
+        tokens = text.lower().split()
+        
+        # Count term frequencies
+        term_freq = {}
+        for token in tokens:
+            # Use hash of token as index (Milvus will handle this)
+            token_id = hash(token) % 1000000  # Keep indices reasonable
+            term_freq[token_id] = term_freq.get(token_id, 0) + 1
+        
+        # Normalize frequencies (simple approach)
+        max_freq = max(term_freq.values()) if term_freq else 1
+        sparse_vector = {
+            idx: freq / max_freq 
+            for idx, freq in term_freq.items()
+        }
+        
+        return sparse_vector
+    
+    def _embed_chunks_with_management(self, chunk_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Generate BOTH dense and sparse vectors for chunks.
+        """
+        texts = [chunk['chunk_text'] for chunk in chunk_dicts]
+        
+        try:
+            # Clear memory
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            
+            # === Generate Dense Vectors (sentence-transformers) ===
+            logger.info(f"Generating dense embeddings for {len(texts)} chunks...")
+            all_embeddings = []
+            num_batches = (len(texts) + self.embedding_batch_size - 1) // self.embedding_batch_size
+            
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * self.embedding_batch_size
+                end_idx = min(start_idx + self.embedding_batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+                
+                batch_embeddings = self.embedding_model.encode(
+                    batch_texts,
+                    batch_size=self.embedding_batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    device=self.device
+                )
+                
+                all_embeddings.append(batch_embeddings)
+                
+                if self.device == "mps":
+                    torch.mps.empty_cache()
+            
+            # Concatenate dense embeddings
+            if len(all_embeddings) > 1:
+                dense_embeddings = np.vstack(all_embeddings)
+            else:
+                dense_embeddings = all_embeddings[0]
+            
+            # === Generate Sparse Vectors (BM25) ===
+            logger.info(f"Generating BM25 sparse vectors for {len(texts)} chunks...")
+            sparse_vectors = [
+                self.generate_sparse_vector(text) 
+                for text in texts
+            ]
+            
+            # === Update Chunks ===
+            for chunk, dense_emb, sparse_vec in zip(chunk_dicts, dense_embeddings, sparse_vectors):
+                chunk['dense_vector'] = dense_emb.tolist()
+                chunk['sparse_vector'] = sparse_vec
+                chunk['embedding_model'] = EmbeddingModel.ALL_MPNET_BASE_V2.value
+            
+            logger.info(f"✅ Generated both dense and sparse vectors")
+            
+        except Exception as e:
+            logger.error(f"Embedding failed: {e}")
             return []
         
-        texts = [chunk['chunk_text'] for chunk in chunk_dicts]
-        start_time = time.time()
-        
-        # Run in thread pool to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            self.executor,
-            self._embed_batch_sync,
-            texts
-        )
-        
-        # Update chunks
-        for chunk, embedding in zip(chunk_dicts, embeddings):
-            chunk['embedding'] = embedding
-            chunk['embedding_model'] = EmbeddingModel.ALL_MPNET_BASE_V2.value
-        
-        duration = time.time() - start_time
-        speed = len(texts) / duration if duration > 0 else 0
-        logger.info(f"Embedded {len(texts)} chunks in {duration:.2f}s ({speed:.1f} chunks/sec)")
-        
         return chunk_dicts
-
-    def _initialize_json_file(self, file_path: Path):
-        """Initialize JSON file"""
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('{\n  "rows": [\n')
-        
-        logger.info(f"Initialized: {file_path}")
-
-    async def _append_to_json_async(self, chunks: List[Dict[str, Any]], file_path: Path, needs_comma: bool):
-        """Async JSON append"""
-        if not chunks:
+    
+    def _cleanup_memory(self):
+        """Memory cleanup"""
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        gc.collect()
+    
+    def _insert_to_milvus_direct(self, chunk_dicts: List[Dict[str, Any]]):
+        """
+        Insert chunks directly to Milvus (for small batches).
+        """
+        if not chunk_dicts:
             return
-
-        # Prepare JSON in memory
-        json_parts = []
-        for i, chunk in enumerate(chunks):
-            if needs_comma or i > 0:
-                json_parts.append(',\n')
-            
-            cleaned = {
-                "chunk_id": chunk.get("chunk_id", f"unknown_{i}"),
+        
+        logger.info(f"Inserting {len(chunk_dicts)} chunks to Milvus...")
+        
+        # Prepare data in Milvus format
+        data = []
+        for chunk in chunk_dicts:
+            row = {
+                "chunk_id": chunk.get("chunk_id", chunk.get("id")),
                 "doc_id": chunk.get("doc_id", ""),
                 "doc_name": chunk.get("doc_name", ""),
-                "chunk_index": chunk.get("chunk_index", i),
+                "chunk_index": chunk.get("chunk_index", 0),
                 "chunk_text": chunk.get("chunk_text", ""),
                 "chunk_size": chunk.get("chunk_size", 0),
                 "chunk_tokens": chunk.get("chunk_tokens", 0),
@@ -160,100 +224,137 @@ class FinalOptimizedPipeline:
                 "content_type": chunk.get("content_type", "text"),
                 "embedding_model": chunk.get("embedding_model", ""),
                 "created_at": chunk.get("created_at", ""),
-                "embedding": chunk.get("embedding", [])
+                "dense_vector": chunk.get("dense_vector", []),
+                "sparse_vector": chunk.get("sparse_vector", {})
             }
-            
-            if not isinstance(cleaned["embedding"], list) or len(cleaned["embedding"]) == 0:
-                continue
-            
-            chunk_str = json.dumps(cleaned, ensure_ascii=False)
-            json_parts.append('    ' + chunk_str.replace('\n', '\n    '))
-
-        # Write to file in thread pool
-        content = ''.join(json_parts)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            self.executor,
-            self._write_to_file,
-            file_path,
-            content
-        )
-
-    def _write_to_file(self, file_path: Path, content: str):
-        """Sync file write"""
-        with open(file_path, 'a', encoding='utf-8') as f:
-            f.write(content)
-
-    def _finalize_json_file(self, file_path: Path):
-        """Finalize JSON file"""
-        with open(file_path, 'a', encoding='utf-8') as f:
-            f.write('\n  ]\n}\n')
+            data.append(row)
         
-        # Quick validation
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        rows = data.get("rows", [])
-        logger.info(f"Finalized: {len(rows)} rows")
-
-    async def _process_file_async(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Async file processing"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.executor,
-            self._process_file_sync,
-            file_path
-        )
-
-    def _process_file_sync(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Sync file processing"""
+        # Insert to Milvus
         try:
+            result = self.milvus_client.insert(
+                collection_name=COLLECTION_NAME,
+                data=data
+            )
+            logger.info(f"✅ Inserted {result['insert_count']} chunks to Milvus")
+        except Exception as e:
+            logger.error(f"❌ Milvus insert failed: {e}")
+            raise
+    
+    def _initialize_json_file(self, file_path: Path):
+        """Initialize JSON file for bulk import (optional backup)"""
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write('{\n  "rows": [\n')
+        
+        logger.info(f"Initialized JSON backup: {file_path}")
+    
+    def _append_to_json_file(self, chunks: List[Dict[str, Any]], file_path: Path, needs_comma: bool):
+        """Append to JSON backup file"""
+        if not chunks:
+            return
+        
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                for i, chunk in enumerate(chunks):
+                    if needs_comma or i > 0:
+                        f.write(',\n')
+                    
+                    # Simplified for JSON (Milvus native format may differ)
+                    cleaned_chunk = {
+                        "chunk_id": chunk.get("chunk_id"),
+                        "doc_id": chunk.get("doc_id"),
+                        "doc_name": chunk.get("doc_name"),
+                        "chunk_index": chunk.get("chunk_index", 0),
+                        "chunk_text": chunk.get("chunk_text", ""),
+                        "chunk_size": chunk.get("chunk_size", 0),
+                        "chunk_tokens": chunk.get("chunk_tokens", 0),
+                        "chunk_method": chunk.get("chunk_method"),
+                        "chunk_overlap": chunk.get("chunk_overlap", 0),
+                        "domain": chunk.get("domain"),
+                        "content_type": chunk.get("content_type"),
+                        "embedding_model": chunk.get("embedding_model"),
+                        "created_at": chunk.get("created_at", ""),
+                        "dense_vector": chunk.get("dense_vector"),
+                        "sparse_vector": chunk.get("sparse_vector")
+                    }
+                    
+                    chunk_str = json.dumps(cleaned_chunk, ensure_ascii=False)
+                    indented = '    ' + chunk_str.replace('\n', '\n    ')
+                    f.write(indented)
+            
+        except Exception as e:
+            logger.error(f"Failed to append to JSON: {e}")
+    
+    def _finalize_json_file(self, file_path: Path):
+        """Finalize JSON backup"""
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write('\n  ]\n}\n')
+            logger.info(f"JSON backup finalized: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to finalize JSON: {e}")
+    
+    def _process_file_sync(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Process a single file"""
+        try:
+            # Read document
             document = DocumentReader.read_file(file_path)
             if not document:
                 return []
+            
+            # Chunk document
             chunks = ChunkingService.chunk_document(document, self.config)
-            return [chunk.model_dump(by_alias=False) for chunk in chunks]
+            chunk_dicts = [chunk.model_dump(by_alias=False) for chunk in chunks]
+            
+            # ⭐ CLEAN CHUNKS BEFORE EMBEDDING ⭐
+            cleaned_chunks = clean_chunks_before_embedding(chunk_dicts)
+            
+            logger.info(f"Processed {file_path.name}: {len(chunks)} -> {len(cleaned_chunks)} chunks after cleaning")
+            
+            return cleaned_chunks
+            
         except Exception as e:
             logger.error(f"Error processing {file_path.name}: {e}")
             return []
-
-    async def process_pipeline(
-        self, 
-        input_dir: str, 
+    
+    def process_complete_pipeline(
+        self,
+        input_dir: str,
         output_dir: str,
-        use_bulk_import: bool = True
+        use_direct_insert: bool = True
     ):
-        """Main pipeline"""
-        
+        """
+        Main pipeline with direct Milvus insertion.
+        """
         pipeline_start = time.time()
         input_path = Path(input_dir)
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
-        output_file = output_path / "prepared_data.json"
+        output_file = output_path / "prepared_data_hybrid.json"
         
         try:
+            # Initialize JSON backup
             self._initialize_json_file(output_file)
-            logger.info("=== STARTING OPTIMIZED CPU PIPELINE ===")
             
-            # Find files
-            #files = DocumentReader.find_files(input_path) 
-            # Try to fetch files from SQLite (if database exists)
+            logger.info("=== STARTING MILVUS HYBRID PIPELINE ===")
+            
+            # Discover files
             db_path = input_path / "documents.db"
             if db_path.exists():
-                logger.info(f"Fetching pending files from SQLite: {db_path}")
+                logger.info(f"Fetching from SQLite: {db_path}")
                 files = get_files_from_sqlite(str(db_path))
-                # get_files_from_sqlite returns list of (doc_id, Path)
                 files = [(doc_id, path) for doc_id, path in files]
-    
             else:
-                logger.info("No SQLite DB found — scanning input directory instead.")
+                logger.info("Scanning input directory...")
                 file_paths = DocumentReader.find_files(input_path)
-                # Wrap with dummy doc_ids (None)
                 files = [(None, path) for path in file_paths]
-
+            
             logger.info(f"Found {len(files)} files to process")
-
             
             if not files:
                 self._finalize_json_file(output_file)
@@ -262,88 +363,66 @@ class FinalOptimizedPipeline:
             total_chunks = 0
             
             # Process each file
-            for i, (doc_id,file_path) in enumerate(files):
+            for i, (doc_id, file_path) in enumerate(files, 1):
                 file_start = time.time()
-                logger.info(f"[{i+1}/{len(files)}] Processing: {file_path.name} (doc_id={doc_id})")
+                logger.info(f"\n[{i}/{len(files)}] Processing: {file_path.name}")
                 
                 try:
                     # Read and chunk
-                    chunk_dicts = await self._process_file_async(file_path)
-                    # Attach doc_id (if from SQLite)
-                    if doc_id is not None:                        
-                        for chunk in chunk_dicts:                            
-                            chunk["doc_id"] = doc_id
-
+                    chunk_dicts = self._process_file_sync(file_path)
                     
                     if not chunk_dicts:
-                        logger.warning(f"No chunks: {file_path.name}")
                         continue
                     
-                    logger.info(f"Generated {len(chunk_dicts)} chunks")
+                    # Attach doc_id from SQLite
+                    if doc_id:
+                        for chunk in chunk_dicts:
+                            chunk["doc_id"] = doc_id
                     
                     # Process in batches
-                    for batch_idx in range(0, len(chunk_dicts), self.write_batch_size):
-                        batch_end = min(batch_idx + self.write_batch_size, len(chunk_dicts))
-                        batch = chunk_dicts[batch_idx:batch_end]
+                    for batch_start in range(0, len(chunk_dicts), self.chunk_batch_size):
+                        batch_end = min(batch_start + self.chunk_batch_size, len(chunk_dicts))
+                        batch = chunk_dicts[batch_start:batch_end]
                         
-                        batch_num = batch_idx // self.write_batch_size + 1
-                        total_batches = (len(chunk_dicts) + self.write_batch_size - 1) // self.write_batch_size
-                        logger.info(f"Batch {batch_num}/{total_batches}: {len(batch)} chunks")
+                        logger.info(f"Batch: chunks {batch_start}-{batch_end-1}")
                         
-                        # Embed
-                        embedded = await self._embed_chunks_async(batch)
+                        # Generate embeddings (dense + sparse)
+                        embedded_batch = self._embed_chunks_with_management(batch)
                         
-                        # Write
-                        await self._append_to_json_async(
-                            embedded,
+                        # Insert to Milvus directly
+                        if use_direct_insert:
+                            self._insert_to_milvus_direct(embedded_batch)
+                        
+                        # Backup to JSON
+                        self._append_to_json_file(
+                            embedded_batch,
                             output_file,
                             total_chunks > 0
                         )
                         
-                        total_chunks += len(embedded)
+                        total_chunks += len(embedded_batch)
                         
-                        # Thermal management: brief pause every 3 batches
-                        if batch_num % 3 == 0:
-                            await asyncio.sleep(0.3)
-                        else:
-                            await asyncio.sleep(0)
-                        
-                        gc.collect()
+                        # Cleanup
+                        self._cleanup_memory()
                     
                     file_time = time.time() - file_start
-                    logger.info(f"Completed {file_path.name} in {file_time:.2f}s")
+                    logger.info(f"✅ Completed {file_path.name} in {file_time:.2f}s")
                     
                 except Exception as e:
-                    logger.error(f"Error: {e}", exc_info=True)
+                    logger.error(f"❌ Error: {e}", exc_info=True)
                     continue
             
             # Finalize
             self._finalize_json_file(output_file)
-            logger.info(f"Total chunks processed: {total_chunks}")
-            
-            # Bulk import
-            if use_bulk_import and total_chunks > 0:
-                logger.info("Starting bulk import...")
-                try:
-                    importer = EnhancedMilvusBulkImporter()
-                    object_name = importer.upload_to_minio(output_file)
-                    importer.run_bulk_import("rag_chunks", object_name)
-                except Exception as e:
-                    logger.error(f"Bulk import failed: {e}", exc_info=True)
-
-            # Populate SQLite database from the generated JSON
-            if db_path.exists() and total_chunks > 0:
-                logger.info(f"Populating SQLite database: {db_path}")
-                populate_db_from_json(str(db_path), str(output_file))
             
             total_time = time.time() - pipeline_start
-            logger.info("=== PIPELINE COMPLETED ===")
-            logger.info(f"Total time: {total_time:.2f}s")
-            if total_chunks > 0:
-                logger.info(f"Average speed: {total_chunks/total_time:.1f} chunks/sec")
-                
+            logger.info("\n=== PIPELINE COMPLETED ===")
+            logger.info(f"Total chunks: {total_chunks}")
+            logger.info(f"Total time: {total_time/60:.2f} minutes")
+            logger.info(f"Speed: {total_chunks/total_time:.1f} chunks/sec")
+            
         except Exception as e:
-            logger.error(f"Critical error: {e}", exc_info=True)
+            logger.error(f"❌ Critical error: {e}", exc_info=True)
             try:
                 self._finalize_json_file(output_file)
             except:
@@ -353,13 +432,14 @@ class FinalOptimizedPipeline:
             self.executor.shutdown(wait=True)
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Final optimized CPU pipeline")
+def main():
+    parser = argparse.ArgumentParser(description="Milvus Hybrid Pipeline with BM25")
     parser.add_argument("--input-dir", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--chunk-overlap", type=int, default=256)
-    parser.add_argument("--no-bulk-import", action="store_true")
+    parser.add_argument("--no-direct-insert", action="store_true",
+                       help="Skip direct Milvus insertion (JSON only)")
     
     args = parser.parse_args()
     
@@ -368,13 +448,13 @@ async def main():
         chunk_overlap=args.chunk_overlap
     )
     
-    pipeline = FinalOptimizedPipeline(config)
-    await pipeline.process_pipeline(
+    pipeline = MilvusHybridPipeline(config)
+    pipeline.process_complete_pipeline(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        use_bulk_import=not args.no_bulk_import
+        use_direct_insert=not args.no_direct_insert
     )
 
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    main()

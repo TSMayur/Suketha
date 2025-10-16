@@ -11,6 +11,9 @@ import logging
 import torch
 import sys
 logger = logging.getLogger(__name__)
+# Add these imports
+from pymilvus import MilvusClient
+from collections import Counter
 
 class OptimizedMilvusVectorStore:
     _vectorstore = None
@@ -50,9 +53,18 @@ class OptimizedMilvusVectorStore:
             cls._wait_for_milvus()
             cls._connected = True
         return True
-
+    
+    @staticmethod
+    def create_sparse_vector(text: str):
+        """Creates a sparse vector from text by counting word frequencies."""
+        if not text:
+            return {}
+        # Simple whitespace tokenizer
+        tokens = text.lower().split()
+        return Counter(tokens)
+    
     @classmethod
-    def setup_schema(cls, class_name: str = "rag_chunks"):
+    def setup_schema(cls, class_name: str = "rag_chunks_hybrid"):
         cls.get_client()
         connection_args = {"uri": "http://localhost:19530"}
         try:
@@ -62,7 +74,7 @@ class OptimizedMilvusVectorStore:
                 connection_args=connection_args,
                 consistency_level="Eventually",
                 drop_old=False,
-                vector_field="embedding",
+                vector_field="dense_vector",
                 text_field="chunk_text",
                 enable_dynamic_field=True,
                 index_params={
@@ -80,7 +92,7 @@ class OptimizedMilvusVectorStore:
             raise e
 
     @classmethod
-    async def insert_chunks_async(cls, chunk_dicts: List[Dict], class_name: str = "rag_chunks"):
+    async def insert_chunks_async(cls, chunk_dicts: List[Dict], class_name: str = "rag_chunks_hybrid"):
         """Optimized async insertion with larger batches and corrected metadata."""
         if cls._vectorstore is None:
             cls.setup_schema(class_name)
@@ -154,7 +166,7 @@ class OptimizedMilvusVectorStore:
     # ... (other methods remain the same) ...
 
     @classmethod
-    def insert_chunks_sync(cls, chunk_dicts: List[Dict], class_name: str = "rag_chunks"):
+    def insert_chunks_sync(cls, chunk_dicts: List[Dict], class_name: str = "rag_chunks_hybrid"):
         """Synchronous version for compatibility"""
         asyncio.run(cls.insert_chunks_async(chunk_dicts, class_name))
 
@@ -199,7 +211,7 @@ class OptimizedMilvusVectorStore:
             return []
 
     @classmethod
-    def get_stats(cls, class_name: str = "rag_chunks") -> Dict[str, Any]:
+    def get_stats(cls, class_name: str = "rag_chunks_hybrid") -> Dict[str, Any]:
         try:
             cls.get_client()
             from pymilvus import Collection, utility
@@ -216,7 +228,7 @@ class OptimizedMilvusVectorStore:
             return {"error": str(e), "status": "error", "total_chunks": 0}
 
     @classmethod
-    def clear_all_data(cls, class_name: str = "rag_chunks"):
+    def clear_all_data(cls, class_name: str = "rag_chunks_hybrid"):
         try:
             logger.info("Clearing database...")
             from pymilvus import utility
