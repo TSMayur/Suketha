@@ -1,24 +1,26 @@
 # src/project/process_all_queries.py
 """
-OPTIMIZED v4: FAST PARALLEL Milvus Native Hybrid Search
+OPTIMIZED v4: Milvus Native Hybrid Search with Parallel Processing + CSV
+Based on: https://milvus.io/docs/hybrid_search_with_milvus.md
 
 Key Features:
-1. ⚡ Parallel query processing with ThreadPoolExecutor
-2. 🚀 Batch embedding generation (10-50x faster)
-3. 🎯 Milvus native hybrid_search() API
-4. 🔄 WeightedRanker for optimal fusion
-5. 🧠 Optional cross-encoder reranking
-6. 🔐 SHA256 deterministic sparse vectors
+1. Native Milvus hybrid_search() API (10x faster)
+2. AnnSearchRequest + WeightedRanker for optimal fusion
+3. Parallel batch processing for maximum speed
+4. Cross-encoder reranking for accuracy
+5. Comprehensive CSV output with all scores
+6. SHA256 deterministic sparse vectors
 """
 
 import json
 import zipfile
 import logging
+import csv
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Set
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from pymilvus import (
     MilvusClient,
     Collection,
@@ -29,30 +31,35 @@ from pymilvus import (
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import numpy as np
 
-# Configuration
-QUERIES_FILE = 'queries.json'
-OUTPUT_DIR = 'submission_hybrid_milvus'
-ZIP_FILENAME = 'PS04_TEAM.zip'
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-MILVUS_URI = "http://4.213.199.69:19530"
-TOKEN="SecurePassword123"
+QUERIES_FILE = '1.json'
+OUTPUT_DIR = 'submission_hybrid_milvus'
+ZIP_FILENAME = 'MILVUS_HYBRID_search.zip'
+CSV_OUTPUT = 'milvus_hybrid_search_results.csv'
+
+MILVUS_URI = "http://localhost:19530"
 COLLECTION_NAME = "rag_chunks_hybrid"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 # Search parameters
-SEARCH_LIMIT = 50  # Get more candidates for reranking
+SEARCH_LIMIT = 50   # Candidates for reranking
 FINAL_TOP_K = 5     # Final results to return
 
-# Hybrid search weights (tune these for best results)
-SPARSE_WEIGHT = 0.7  # Weight for BM25/keyword matching
-DENSE_WEIGHT = 1.0   # Weight for semantic similarity
+# Hybrid search weights (tune for best results)
+SPARSE_WEIGHT = 0.7  # BM25/keyword matching
+DENSE_WEIGHT = 1.0   # Semantic similarity
 
+# Cross-encoder
 USE_CROSS_ENCODER = True
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# ⚡ Performance settings
-EMBEDDING_BATCH_SIZE = 64  # Batch queries for embedding
-MAX_WORKERS = 32            # Parallel search threads
+# Performance config
+EMBEDDING_BATCH_SIZE = 64
+MAX_WORKERS = 16
+WRITE_WORKERS = 4
 
 # Sparse vector config
 VOCAB_SIZE = 10_000_000
@@ -65,7 +72,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Stopwords
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
 STOPWORDS: Set[str] = {
     'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
     'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that',
@@ -89,13 +99,18 @@ def tokenize_text(text: str) -> List[str]:
     return tokens
 
 
-class FastParallelHybridProcessor:
+# ============================================================================
+# OPTIMIZED HYBRID QUERY PROCESSOR
+# ============================================================================
+
+class OptimizedHybridQueryProcessor:
     """
-    ⚡ FAST parallel hybrid search using Milvus native API
+    Fast hybrid search with parallel processing and CSV output
     """
     
     def __init__(self):
-        logger.info("Initializing FAST Parallel Hybrid Processor v4...")
+        logger.info("Initializing Optimized Hybrid Query Processor v4...")
+        logger.info("="*70)
         
         # Load embedding model
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
@@ -116,8 +131,10 @@ class FastParallelHybridProcessor:
         # Connect to Milvus
         self._connect_to_milvus()
         
-        logger.info(f"⚡ Parallel workers: {MAX_WORKERS}")
-        logger.info(f"📦 Batch size: {EMBEDDING_BATCH_SIZE}")
+        # CSV storage
+        self.csv_data = []
+        
+        logger.info("="*70)
         logger.info("✓ Initialization complete\n")
     
     def _connect_to_milvus(self, max_retries=5, retry_delay=3):
@@ -126,25 +143,24 @@ class FastParallelHybridProcessor:
         
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"Connection attempt {attempt}/{max_retries}...")
-                self.client = MilvusClient(uri=MILVUS_URI,token=TOKEN, timeout=30)
-                connections.connect("default", uri=MILVUS_URI,token=TOKEN, timeout=30)
+                logger.info(f"Attempt {attempt}/{max_retries}...")
+                self.client = MilvusClient(uri=MILVUS_URI, timeout=30)
+                connections.connect("default", uri=MILVUS_URI, timeout=30)
                 break
             except Exception as e:
-                logger.warning(f"Attempt {attempt} failed: {e}")
+                logger.warning(f"Failed: {e}")
                 if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    logger.info(f"Retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                 else:
-                    raise RuntimeError(f"Failed to connect after {max_retries} attempts") from e
+                    raise RuntimeError(f"Connection failed after {max_retries} attempts") from e
         
         # Verify collection
         logger.info("Checking collection...")
         if not self.client.has_collection(COLLECTION_NAME):
             available = self.client.list_collections()
             raise RuntimeError(
-                f"Collection '{COLLECTION_NAME}' not found! "
-                f"Available: {available}"
+                f"Collection '{COLLECTION_NAME}' not found! Available: {available}"
             )
         
         # Get collection object for hybrid search
@@ -155,7 +171,7 @@ class FastParallelHybridProcessor:
         has_dense = False
         has_sparse = False
         
-        logger.info("Collection schema:")
+        logger.info("Schema:")
         for field in schema_info['fields']:
             field_name = field['name']
             logger.info(f"  - {field_name}")
@@ -165,7 +181,7 @@ class FastParallelHybridProcessor:
                 has_sparse = True
         
         if not (has_dense and has_sparse):
-            raise RuntimeError("Collection missing hybrid vectors!")
+            raise RuntimeError("Missing hybrid vectors!")
         
         # Load collection
         logger.info("Loading collection...")
@@ -178,7 +194,7 @@ class FastParallelHybridProcessor:
             row_count = stats.get('row_count', 0)
             logger.info(f"✓ Connected: {row_count:,} chunks")
         except:
-            logger.info("✓ Connected (stats unavailable)")
+            logger.info("✓ Connected")
     
     def generate_sparse_vector(self, text: str) -> Dict[int, float]:
         """Generate deterministic sparse vector"""
@@ -192,24 +208,25 @@ class FastParallelHybridProcessor:
             term_freq[token_id] = term_freq.get(token_id, 0) + 1
         
         max_freq = max(term_freq.values())
-        return {tid: freq / max_freq for tid, freq in term_freq.items()}
-    
-    def embed_queries_batch(
-        self,
-        queries: List[Tuple[str, str]]
-    ) -> List[Tuple[str, str, List[float], Dict[int, float]]]:
-        """
-        ⚡ BATCH embed multiple queries at once (MUCH faster!)
+        sparse_vector = {
+            token_id: freq / max_freq
+            for token_id, freq in term_freq.items()
+        }
         
-        Returns: [(query_num, query_text, dense_vec, sparse_vec), ...]
+        return sparse_vector
+    
+    def embed_queries_batch(self, queries: List[Tuple[str, str]]) -> List[Tuple[str, str, np.ndarray, Dict]]:
+        """
+        Batch embed queries for efficiency.
+        Returns: [(query_num, query_text, dense_vector, sparse_vector), ...]
         """
         query_nums = [q[0] for q in queries]
         query_texts = [q[1] for q in queries]
         
-        logger.info(f"⚡ Batch embedding {len(query_texts)} queries...")
-        start = time.time()
+        logger.info(f"Embedding batch of {len(query_texts)} queries...")
+        start_time = time.time()
         
-        # Dense embeddings (batch)
+        # Dense embeddings
         dense_embeddings = self.embedding_model.encode(
             query_texts,
             batch_size=EMBEDDING_BATCH_SIZE,
@@ -218,52 +235,50 @@ class FastParallelHybridProcessor:
             normalize_embeddings=True
         )
         
-        # Sparse vectors (parallel generation)
-        sparse_vectors = [self.generate_sparse_vector(text) for text in query_texts]
+        # Sparse embeddings
+        sparse_embeddings = [self.generate_sparse_vector(text) for text in query_texts]
         
-        duration = time.time() - start
-        logger.info(f"✓ Embedded {len(query_texts)} queries in {duration:.2f}s ({len(query_texts)/duration:.1f} q/s)")
+        duration = time.time() - start_time
+        speed = len(query_texts) / duration
+        logger.info(f"✓ Embedded {len(query_texts)} queries in {duration:.2f}s ({speed:.1f} q/s)")
         
-        # Log stats
-        if sparse_vectors:
-            sizes = [len(sv) for sv in sparse_vectors]
-            logger.info(f"  Sparse dims - avg: {np.mean(sizes):.1f}, min: {min(sizes)}, max: {max(sizes)}")
-        
-        return [
-            (qnum, qtext, dense.tolist(), sparse)
-            for qnum, qtext, dense, sparse in zip(
-                query_nums, query_texts, dense_embeddings, sparse_vectors
-            )
-        ]
+        return list(zip(query_nums, query_texts, dense_embeddings, sparse_embeddings))
     
     def hybrid_search_native(
         self,
-        dense_vector: List[float],
+        query_text: str,
+        dense_vector: np.ndarray,
         sparse_vector: Dict[int, float]
     ) -> List[Dict]:
         """
-        🚀 Native Milvus hybrid search (FAST!)
+        ⭐ OPTIMIZED: Native Milvus hybrid_search() API
+        
+        - Single API call (10x faster than manual RRF)
+        - Native C++ implementation
+        - Optimized WeightedRanker
         """
         # Dense search request
+        dense_search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
         dense_req = AnnSearchRequest(
-            data=[dense_vector],
+            data=[dense_vector.tolist() if isinstance(dense_vector, np.ndarray) else dense_vector],
             anns_field="dense_vector",
-            param={"metric_type": "COSINE", "params": {"ef": 128}},
+            param=dense_search_params,
             limit=SEARCH_LIMIT
         )
         
         # Sparse search request
+        sparse_search_params = {"metric_type": "IP", "params": {}}
         sparse_req = AnnSearchRequest(
             data=[sparse_vector],
             anns_field="sparse_vector",
-            param={"metric_type": "IP", "params": {}},
+            param=sparse_search_params,
             limit=SEARCH_LIMIT
         )
         
-        # Weighted ranker
+        # Weighted ranker for fusion
         reranker = WeightedRanker(SPARSE_WEIGHT, DENSE_WEIGHT)
         
-        # ⚡ Single hybrid search call
+        # ⭐ Single hybrid search call (FAST!)
         results = self.collection.hybrid_search(
             reqs=[sparse_req, dense_req],
             rerank=reranker,
@@ -271,25 +286,26 @@ class FastParallelHybridProcessor:
             output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
         )[0]
         
-        # Format results
-        return [
-            {
+        # Convert to dict format
+        formatted_results = []
+        for rank, hit in enumerate(results, 1):
+            formatted_results.append({
                 'chunk_id': hit.entity.get('chunk_id', ''),
                 'doc_id': hit.entity.get('doc_id', ''),
                 'doc_name': hit.entity.get('doc_name', ''),
                 'chunk_text': hit.entity.get('chunk_text', ''),
                 'hybrid_score': float(hit.score),
                 'rank': rank
-            }
-            for rank, hit in enumerate(results, 1)
-        ]
+            })
+        
+        return formatted_results
     
     def cross_encoder_rerank(
         self,
         query: str,
         candidates: List[Dict]
     ) -> List[Dict]:
-        """Cross-encoder reranking"""
+        """Cross-encoder reranking for accuracy"""
         if not self.cross_encoder or not candidates:
             return candidates
         
@@ -299,28 +315,29 @@ class FastParallelHybridProcessor:
         for candidate, score in zip(candidates, ce_scores):
             candidate['cross_encoder_score'] = float(score)
         
-        return sorted(candidates, key=lambda x: x['cross_encoder_score'], reverse=True)
+        reranked = sorted(
+            candidates,
+            key=lambda x: x['cross_encoder_score'],
+            reverse=True
+        )
+        
+        return reranked
     
-    def process_single_query(
-        self,
-        query_data: Tuple[str, str, List[float], Dict[int, float]]
-    ) -> Dict:
-        """
-        Process single query (called in parallel)
-        """
+    def process_single_query(self, query_data: Tuple[str, str, np.ndarray, Dict]) -> Dict:
+        """Process single query"""
         query_num, query_text, dense_vec, sparse_vec = query_data
         
         try:
-            # Native hybrid search
-            hybrid_results = self.hybrid_search_native(dense_vec, sparse_vec)
+            # Native hybrid search (FAST!)
+            hybrid_results = self.hybrid_search_native(query_text, dense_vec, sparse_vec)
             
-            # Cross-encoder reranking
+            # Cross-encoder reranking (optional)
             if USE_CROSS_ENCODER and hybrid_results:
                 final_results = self.cross_encoder_rerank(query_text, hybrid_results)[:FINAL_TOP_K]
             else:
                 final_results = hybrid_results[:FINAL_TOP_K]
             
-            # Extract unique doc_ids
+            # Extract doc_ids
             doc_ids = []
             seen = set()
             for result in final_results:
@@ -328,6 +345,20 @@ class FastParallelHybridProcessor:
                 if doc_name and doc_name not in seen:
                     doc_ids.append(doc_name)
                     seen.add(doc_name)
+            
+            # Store for CSV
+            for rank, result in enumerate(final_results, 1):
+                self.csv_data.append({
+                    'query_num': query_num,
+                    'query_text': query_text,
+                    'rank': rank,
+                    'chunk_id': result.get('chunk_id', ''),
+                    'doc_id': result.get('doc_id', ''),
+                    'doc_name': result.get('doc_name', ''),
+                    'hybrid_score': result.get('hybrid_score', 0.0),
+                    'cross_encoder_score': result.get('cross_encoder_score', 0.0),
+                    'chunk_text': result.get('chunk_text', '')[:500]
+                })
             
             logger.info(f"✓ Query {query_num}: {len(doc_ids)} docs")
             
@@ -348,34 +379,29 @@ class FastParallelHybridProcessor:
                 "error": str(e)
             }
     
-    def search_parallel_batch(
-        self,
-        embedded_queries: List[Tuple[str, str, List[float], Dict[int, float]]]
-    ) -> List[Dict]:
-        """
-        ⚡ PARALLEL search execution (FAST!)
-        """
-        logger.info(f"⚡ Parallel searching {len(embedded_queries)} queries...")
-        start = time.time()
+    def search_parallel_batch(self, embedded_queries: List) -> List[Dict]:
+        """Search queries in parallel"""
+        logger.info(f"Searching {len(embedded_queries)} queries in parallel...")
+        start_time = time.time()
         
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Submit all queries
-            futures = {
+            future_to_query = {
                 executor.submit(self.process_single_query, query_data): query_data[0]
                 for query_data in embedded_queries
             }
             
-            # Collect results as they complete
-            for future in as_completed(futures):
+            for future in as_completed(future_to_query):
                 try:
                     result = future.result()
                     results.append(result)
                 except Exception as e:
-                    logger.error(f"Query failed: {e}")
+                    query_num = future_to_query[future]
+                    logger.error(f"✗ Query {query_num}: {e}")
         
-        duration = time.time() - start
-        logger.info(f"✓ Searched {len(embedded_queries)} queries in {duration:.2f}s ({len(embedded_queries)/duration:.1f} q/s)")
+        duration = time.time() - start_time
+        speed = len(embedded_queries) / duration if duration > 0 else 0
+        logger.info(f"✓ Searched {len(embedded_queries)} queries in {duration:.2f}s ({speed:.1f} q/s)")
         
         return results
     
@@ -395,11 +421,48 @@ class FastParallelHybridProcessor:
             logger.error(f"Write failed: {e}")
             return False
     
+    def write_results_parallel(self, results: List[Dict], output_path: Path) -> int:
+        """Write result files in parallel"""
+        logger.info(f"Writing {len(results)} result files...")
+        start_time = time.time()
+        
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=WRITE_WORKERS) as executor:
+            futures = [
+                executor.submit(self.write_result_file, result, output_path)
+                for result in results
+            ]
+            
+            for future in as_completed(futures):
+                if future.result():
+                    success_count += 1
+        
+        duration = time.time() - start_time
+        logger.info(f"✓ Wrote {success_count}/{len(results)} files in {duration:.2f}s")
+        
+        return success_count
+    
+    def write_csv_results(self):
+        """Write comprehensive CSV with all scores"""
+        logger.info(f"Writing CSV to {CSV_OUTPUT}...")
+        
+        try:
+            with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'query_num', 'query_text', 'rank', 'chunk_id', 'doc_id', 'doc_name',
+                    'hybrid_score', 'cross_encoder_score', 'chunk_text'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.csv_data)
+            
+            logger.info(f"✓ CSV written: {len(self.csv_data)} rows")
+        except Exception as e:
+            logger.error(f"CSV write failed: {e}")
+    
     def process_all_queries(self):
-        """
-        ⚡ FAST parallel processing pipeline
-        """
-        pipeline_start = time.time()
+        """Main processing pipeline"""
+        start_time = time.time()
         
         # Load queries
         logger.info(f"Loading queries from {QUERIES_FILE}...")
@@ -412,15 +475,10 @@ class FastParallelHybridProcessor:
             if item.get("query_num") and item.get("query")
         ]
         
-        logger.info(f"\n{'='*70}")
-        logger.info(f"⚡ FAST PARALLEL HYBRID SEARCH")
-        logger.info(f"{'='*70}")
-        logger.info(f"Total queries: {len(queries)}")
-        logger.info(f"Strategy: Milvus Native Hybrid Search + Cross-Encoder")
+        logger.info(f"Processing {len(queries)} queries")
+        logger.info(f"Strategy: Native Hybrid Search + Cross-Encoder + Parallel")
         logger.info(f"Weights: Sparse={SPARSE_WEIGHT}, Dense={DENSE_WEIGHT}")
-        logger.info(f"Parallel workers: {MAX_WORKERS}")
-        logger.info(f"Batch size: {EMBEDDING_BATCH_SIZE}")
-        logger.info(f"{'='*70}\n")
+        logger.info("="*70)
         
         # Create output dir
         output_path = Path(OUTPUT_DIR)
@@ -428,64 +486,70 @@ class FastParallelHybridProcessor:
         
         # Process in batches
         all_results = []
+        total_queries = len(queries)
         
-        for batch_start in range(0, len(queries), EMBEDDING_BATCH_SIZE):
-            batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, len(queries))
+        for batch_start in range(0, total_queries, EMBEDDING_BATCH_SIZE):
+            batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, total_queries)
             batch_queries = queries[batch_start:batch_end]
             
+            batch_num = (batch_start // EMBEDDING_BATCH_SIZE) + 1
+            total_batches = (total_queries + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
+            
             logger.info(f"\n{'='*70}")
-            logger.info(f"BATCH: Queries {batch_start+1}-{batch_end} ({len(batch_queries)} queries)")
+            logger.info(f"BATCH {batch_num}/{total_batches} (queries {batch_start+1}-{batch_end})")
             logger.info(f"{'='*70}")
             
-            # Step 1: Batch embed (FAST!)
+            # Embed batch
             embedded_queries = self.embed_queries_batch(batch_queries)
             
-            # Step 2: Parallel search (FAST!)
+            # Search in parallel
             batch_results = self.search_parallel_batch(embedded_queries)
             
-            # Step 3: Write results
-            for result in batch_results:
-                self.write_result_file(result, output_path)
+            # Write results in parallel
+            self.write_results_parallel(batch_results, output_path)
             
             all_results.extend(batch_results)
             
             # Progress
-            progress = len(all_results) / len(queries) * 100
-            elapsed = time.time() - pipeline_start
-            speed = len(all_results) / elapsed if elapsed > 0 else 0
-            remaining = len(queries) - len(all_results)
+            processed = len(all_results)
+            elapsed = time.time() - start_time
+            speed = processed / elapsed if elapsed > 0 else 0
+            remaining = total_queries - processed
             eta = remaining / speed if speed > 0 else 0
             
-            logger.info(f"\n📊 Progress: {len(all_results)}/{len(queries)} ({progress:.1f}%)")
-            logger.info(f"⚡ Speed: {speed:.2f} q/s | ⏱️  ETA: {eta/60:.1f} min")
+            logger.info(f"\nProgress: {processed}/{total_queries} ({100*processed/total_queries:.1f}%)")
+            logger.info(f"Speed: {speed:.1f} q/s | ETA: {eta/60:.1f} min")
+        
+        # Write CSV
+        self.write_csv_results()
         
         # Create zip
-        logger.info(f"\n📦 Creating {ZIP_FILENAME}...")
-        with zipfile.ZipFile(ZIP_FILENAME, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file in output_path.glob("*.json"):
-                zf.write(file, arcname=file.name)
+        logger.info(f"\nCreating {ZIP_FILENAME}...")
+        json_files = list(output_path.glob("*.json"))
         
-        # Final stats
-        total_time = time.time() - pipeline_start
+        with zipfile.ZipFile(ZIP_FILENAME, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file_path in json_files:
+                zf.write(file_path, arcname=file_path.name)
+        
+        # Stats
+        total_time = time.time() - start_time
         success_count = sum(1 for r in all_results if r["success"])
-        avg_speed = len(queries) / total_time
         
         logger.info(f"\n{'='*70}")
-        logger.info("⚡ FAST PARALLEL HYBRID SEARCH COMPLETE")
+        logger.info("OPTIMIZED HYBRID SEARCH COMPLETE")
         logger.info(f"{'='*70}")
-        logger.info(f"Method: Milvus Native hybrid_search() + WeightedRanker")
+        logger.info(f"Method: Native hybrid_search() + WeightedRanker + Parallel")
         logger.info(f"Total: {len(queries)} | Success: {success_count} | Failed: {len(queries)-success_count}")
-        logger.info(f"Time: {total_time/60:.2f} minutes ({total_time:.1f} seconds)")
-        logger.info(f"Average speed: {avg_speed:.2f} queries/second")
-        logger.info(f"Workers: {MAX_WORKERS} parallel threads")
-        logger.info(f"Output: {ZIP_FILENAME}")
+        logger.info(f"Time: {total_time/60:.2f} min | Speed: {len(queries)/total_time:.2f} q/s")
+        logger.info(f"Output ZIP: {ZIP_FILENAME}")
+        logger.info(f"Output CSV: {CSV_OUTPUT}")
         logger.info(f"{'='*70}")
 
 
 def main():
     """Main entry point"""
     try:
-        processor = FastParallelHybridProcessor()
+        processor = OptimizedHybridQueryProcessor()
         processor.process_all_queries()
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)

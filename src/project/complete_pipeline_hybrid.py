@@ -10,7 +10,7 @@ Features:
 
 This replaces complete_pipeline_hybrid.py with full Milvus BM25 support.
 """
-
+import hashlib
 import argparse
 import asyncio
 import json
@@ -84,7 +84,7 @@ class MilvusHybridPipeline:
             self.chunk_batch_size = 500
         
         # Thread pool
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=8)
         
         # Connect to Milvus
         self._connect_to_milvus()
@@ -94,7 +94,7 @@ class MilvusHybridPipeline:
     def _connect_to_milvus(self):
         """Connect to Milvus"""
         logger.info("Connecting to Milvus...")
-        self.milvus_client = MilvusClient(uri="http://localhost:19530")
+        self.milvus_client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
         
         if not self.milvus_client.has_collection(COLLECTION_NAME):
             logger.error(f"❌ Collection '{COLLECTION_NAME}' not found!")
@@ -108,7 +108,7 @@ class MilvusHybridPipeline:
         Generate BM25 sparse vector from text.
         
         Milvus BM25 uses a simple TF-IDF-like approach:
-        - Term frequencies become sparse vector indices
+        - Term frequencies become sparse vector indicesc
         - Values are normalized scores
         """
         # Tokenize (simple whitespace + lowercase)
@@ -118,7 +118,8 @@ class MilvusHybridPipeline:
         term_freq = {}
         for token in tokens:
             # Use hash of token as index (Milvus will handle this)
-            token_id = hash(token) % 1000000  # Keep indices reasonable
+            hash_bytes = hashlib.sha256(token.encode('utf-8')).digest()
+            token_id = int.from_bytes(hash_bytes[:8], byteorder='big') % 10_000_000
             term_freq[token_id] = term_freq.get(token_id, 0) + 1
         
         # Normalize frequencies (simple approach)

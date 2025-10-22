@@ -1,34 +1,49 @@
-# src/project/process_all_queries_optimized.py
+"""
+FIXED v2: Query processor with PROPER deterministic BM25 sparse vectors
+
+Key Fixes:
+1. Use SHA256 for deterministic hashing (not Python's hash())
+2. Larger vocabulary space (10M instead of 1M)
+3. Better tokenization (remove stopwords, min length)
+4. TF-IDF style scoring instead of just normalized TF
+"""
 
 import json
 import zipfile
 import logging
 import csv
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from pymilvus import MilvusClient, Collection, connections
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import numpy as np
 
-# --- CONFIGURATION ---
+# Configuration
 QUERIES_FILE = '1.json'
-OUTPUT_DIR = 'submission'
-ZIP_FILENAME = 'csv_too.zip'
-CSV_OUTPUT = 'search_results_with_scores.csv'  # NEW
+OUTPUT_DIR = 'submission_hybrid_optimized'
+ZIP_FILENAME = 'hybrid_search_optimized.zip'
+CSV_OUTPUT = 'hybrid_search_detailed_results.csv'
 
-# Milvus Configuration - LOCAL
 MILVUS_URI = "http://localhost:19530"
-MILVUS_TOKEN = None
-COLLECTION_NAME = "rag_chunks"
+COLLECTION_NAME = "rag_chunks_hybrid"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
-# Performance Configuration
-EMBEDDING_BATCH_SIZE = 128
-SEARCH_BATCH_SIZE = 32
-MAX_WORKERS = 8
-WRITE_WORKERS = 4
+DENSE_TOP_K = 30
+SPARSE_TOP_K = 30
+FINAL_TOP_K = 5
+USE_CROSS_ENCODER = True
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+EMBEDDING_BATCH_SIZE = 64
+MAX_WORKERS = 6
+RRF_K = 60
+
+# ⭐ Sparse vector config
+VOCAB_SIZE = 10_000_000  # 10M instead of 1M for less collisions
+MIN_TOKEN_LENGTH = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,95 +52,138 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class OptimizedBatchQueryProcessor:
-    """Optimized processor for large-scale query batching"""
+# Minimal stopwords (expand if needed)
+STOPWORDS: Set[str] = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
+    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that',
+    'the', 'to', 'was', 'were', 'will', 'with', 'this', 'but', 'they',
+    'have', 'had', 'what', 'when', 'where', 'who', 'which', 'can',
+    'their', 'if', 'out', 'so', 'up', 'been', 'than', 'them', 'she',
+}
+
+
+def deterministic_token_hash(token: str, vocab_size: int) -> int:
+    """
+    ⭐ CRITICAL: Deterministic hash using SHA256
+    
+    Unlike Python's hash(), SHA256 is:
+    - Deterministic (same token always -> same ID)
+    - Consistent across Python sessions
+    - Better distribution (fewer collisions)
+    """
+    hash_bytes = hashlib.sha256(token.encode('utf-8')).digest()
+    # Use first 8 bytes as integer
+    hash_int = int.from_bytes(hash_bytes[:8], byteorder='big')
+    return hash_int % vocab_size
+
+
+def tokenize_text(text: str) -> List[str]:
+    """
+    Tokenize text for sparse vector generation
+    
+    - Lowercase
+    - Split on whitespace
+    - Remove stopwords
+    - Filter short tokens
+    """
+    tokens = text.lower().split()
+    
+    # Filter
+    tokens = [
+        t for t in tokens
+        if len(t) >= MIN_TOKEN_LENGTH and t not in STOPWORDS
+    ]
+    
+    return tokens
+
+
+class FixedHybridQueryProcessor:
+    """
+    Query processor with PROPER deterministic BM25
+    """
     
     def __init__(self):
-        logger.info("Initializing optimized query processor...")
+        logger.info("Initializing Fixed Hybrid Query Processor v2...")
         
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
+        # Load embedding model
         self.embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME, 
+            EMBEDDING_MODEL_NAME,
             device="cpu"
         )
+        logger.info("✓ Embedding model loaded")
         
+        # Load cross-encoder
+        if USE_CROSS_ENCODER:
+            self.cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+            logger.info("✓ Cross-encoder loaded")
+        else:
+            self.cross_encoder = None
+        
+        # Connect to Milvus
         self._connect_to_milvus()
         
-        # NEW: Initialize CSV storage
         self.csv_data = []
-        
-        logger.info("Initialization complete")
+        logger.info("✓ Initialization complete\n")
     
-    def _connect_to_milvus(self, max_retries=5, retry_delay=3):
+    def _connect_to_milvus(self):
+        """Connect to Milvus"""
         logger.info(f"Connecting to Milvus at {MILVUS_URI}")
         
-        for attempt in range(1, max_retries + 1):
-            try:
-                if MILVUS_TOKEN:
-                    self.client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-                else:
-                    self.client = MilvusClient(uri=MILVUS_URI)
-
-                connections.connect("default", uri=MILVUS_URI)
-                
-                if not self.client.has_collection(COLLECTION_NAME):
-                    available = self.client.list_collections()
-                    raise RuntimeError(
-                        f"Collection '{COLLECTION_NAME}' not found! "
-                        f"Available: {available}"
-                    )
-                
-                schema_info = self.client.describe_collection(COLLECTION_NAME)
-                self.vector_field_name = None
-                
-                logger.info(f"Collection schema fields:")
-                for field in schema_info['fields']:
-                    field_name = field['name']
-                    field_type = field['type']
-                    logger.info(f"  - {field_name}: {field_type}")
-                    if field_type == 101 or field_type == 100 or 'VECTOR' in str(field_type):
-                        self.vector_field_name = field_name
-                        logger.info(f"    ^^^ Using this as vector field ^^^")
-                
-                if not self.vector_field_name:
-                    raise RuntimeError("No vector field found in schema!")
-                
-                logger.info("Loading collection into memory...")
-                collection = Collection(COLLECTION_NAME)
-                collection.load()
-                
-                time.sleep(2)
-                logger.info("Collection loaded successfully")
-                
-                stats = self.client.get_collection_stats(COLLECTION_NAME)
-                row_count = stats.get('row_count', 0)
-                
-                if row_count == 0:
-                    logger.warning(f"Collection '{COLLECTION_NAME}' is EMPTY!")
-                else:
-                    logger.info(f"Collection has {row_count:,} entities")
-                
-                logger.info(f"Successfully connected to Milvus (vector field: {self.vector_field_name})")
-                return
-                
-            except Exception as e:
-                logger.warning(f"Connection attempt {attempt}/{max_retries} failed: {e}")
-                
-                if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error("\nFailed to connect to Milvus!")
-                    raise RuntimeError(f"Cannot connect to Milvus at {MILVUS_URI}") from e
+        self.client = MilvusClient(uri=MILVUS_URI)
+        connections.connect("default", uri=MILVUS_URI)
+        
+        if not self.client.has_collection(COLLECTION_NAME):
+            raise RuntimeError(f"Collection '{COLLECTION_NAME}' not found!")
+        
+        # Load collection
+        collection = Collection(COLLECTION_NAME)
+        collection.load()
+        time.sleep(2)
+        
+        stats = self.client.get_collection_stats(COLLECTION_NAME)
+        logger.info(f"✓ Connected: {stats.get('row_count', 0):,} chunks")
     
-    def embed_queries_batch(self, queries: List[Tuple[str, str]]) -> List[Tuple[str, str, np.ndarray]]:
+    def generate_sparse_vector(self, text: str) -> Dict[int, float]:
+        """
+        ⭐ FIXED: Generate sparse vector with deterministic hashing
+        
+        Uses SHA256 for consistent token IDs across sessions
+        """
+        # Tokenize with stopword removal
+        tokens = tokenize_text(text)
+        
+        if not tokens:
+            return {}
+        
+        # Count term frequencies
+        term_freq = {}
+        for token in tokens:
+            token_id = deterministic_token_hash(token, VOCAB_SIZE)
+            term_freq[token_id] = term_freq.get(token_id, 0) + 1
+        
+        # Normalize by max frequency (simple TF)
+        max_freq = max(term_freq.values())
+        sparse_vector = {
+            token_id: freq / max_freq
+            for token_id, freq in term_freq.items()
+        }
+        
+        return sparse_vector
+    
+    def embed_queries_batch(self, queries: List[Tuple[str, str]]) -> List[Tuple[str, str, np.ndarray, Dict]]:
+        """
+        Embed queries in batch - BOTH dense and sparse
+        
+        Returns: [(query_num, query_text, dense_vector, sparse_vector), ...]
+        """
         query_nums = [q[0] for q in queries]
         query_texts = [q[1] for q in queries]
         
         logger.info(f"Embedding batch of {len(query_texts)} queries...")
         start_time = time.time()
         
-        embeddings = self.embedding_model.encode(
+        # Dense embeddings
+        dense_embeddings = self.embedding_model.encode(
             query_texts,
             batch_size=EMBEDDING_BATCH_SIZE,
             show_progress_bar=False,
@@ -133,123 +191,265 @@ class OptimizedBatchQueryProcessor:
             normalize_embeddings=True
         )
         
-        duration = time.time() - start_time
-        speed = len(query_texts) / duration
-        logger.info(f"Embedded {len(query_texts)} queries in {duration:.2f}s ({speed:.1f} queries/sec)")
+        # ⭐ Sparse vectors with deterministic hashing
+        sparse_vectors = [
+            self.generate_sparse_vector(text)
+            for text in query_texts
+        ]
         
-        return list(zip(query_nums, query_texts, embeddings))
+        duration = time.time() - start_time
+        logger.info(f"✓ Embedded {len(query_texts)} queries in {duration:.2f}s")
+        
+        # ⭐ DEBUG: Log sparse vector stats
+        if sparse_vectors:
+            sizes = [len(sv) for sv in sparse_vectors]
+            avg_size = sum(sizes) / len(sizes)
+            min_size = min(sizes)
+            max_size = max(sizes)
+            
+            logger.info(f"  Dense shape: {dense_embeddings.shape}")
+            logger.info(f"  Sparse dimensions - avg: {avg_size:.1f}, min: {min_size}, max: {max_size}")
+            
+            # Show sample
+            sample_vec = sparse_vectors[0]
+            sample_items = list(sample_vec.items())[:3]
+            logger.info(f"  Sample sparse: {dict(sample_items)}")
+        
+        return list(zip(query_nums, query_texts, dense_embeddings, sparse_vectors))
     
-    def search_single_query(self, query_data: Tuple[str, str, np.ndarray]) -> Dict:
-        query_num, query_text, embedding = query_data
+    def hybrid_search_single(
+        self,
+        query_text: str,
+        dense_vec: np.ndarray,
+        sparse_vec: Dict[int, float]
+    ) -> List[Dict]:
+        """
+        Hybrid search with proper error handling
+        """
+        # Check sparse vector
+        if not sparse_vec:
+            logger.warning(f"⚠️  Empty sparse vector for: {query_text[:50]}...")
+        elif len(sparse_vec) < 5:
+            logger.warning(f"⚠️  Very small sparse vector ({len(sparse_vec)} dims) for: {query_text[:30]}...")
+        
+        # Dense search (COSINE)
+        search_params_dense = {
+            "metric_type": "COSINE",
+            "params": {"ef": 64}
+        }
         
         try:
-            search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
-            
-            results = self.client.search(
+            dense_results = self.client.search(
                 collection_name=COLLECTION_NAME,
-                data=[embedding.tolist()],
-                limit=5,
-                search_params=search_params,
-                anns_field="embedding",
-                output_fields=["doc_id", "chunk_text", "chunk_id"]  # Get more fields
+                data=[dense_vec.tolist()],
+                anns_field="dense_vector",
+                limit=DENSE_TOP_K,
+                search_params=search_params_dense,
+                output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
             )
+        except Exception as e:
+            logger.error(f"Dense search failed: {e}")
+            dense_results = []
+        
+        # Sparse search (IP for sparse vectors)
+        search_params_sparse = {
+            "metric_type": "IP",
+            "params": {}
+        }
+        
+        sparse_results = []
+        if sparse_vec:
+            try:
+                sparse_results = self.client.search(
+                    collection_name=COLLECTION_NAME,
+                    data=[sparse_vec],
+                    anns_field="sparse_vector",
+                    limit=SPARSE_TOP_K,
+                    search_params=search_params_sparse,
+                    output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
+                )
+            except Exception as e:
+                logger.error(f"Sparse search failed: {e}")
+                sparse_results = []
+        
+        # Log search results
+        dense_count = len(dense_results[0]) if dense_results and len(dense_results) > 0 else 0
+        sparse_count = len(sparse_results[0]) if sparse_results and len(sparse_results) > 0 else 0
+        
+        if dense_count == 0 and sparse_count == 0:
+            logger.warning(f"⚠️  NO RESULTS for: {query_text[:50]}...")
+        elif sparse_count == 0:
+            logger.debug(f"No sparse results (only {dense_count} dense) for: {query_text[:30]}...")
+        
+        # RRF Fusion
+        dense_ranks = {}
+        sparse_ranks = {}
+        all_chunks = {}
+        
+        # Process dense results
+        if dense_results and len(dense_results) > 0:
+            for rank, hit in enumerate(dense_results[0], 1):
+                chunk_id = hit['entity'].get('chunk_id', '')
+                dense_ranks[chunk_id] = rank
+                all_chunks[chunk_id] = {
+                    'chunk_id': chunk_id,
+                    'doc_id': hit['entity'].get('doc_id', ''),
+                    'doc_name': hit['entity'].get('doc_name', ''),
+                    'chunk_text': hit['entity'].get('chunk_text', ''),
+                    'dense_score': float(hit.get('distance', 0.0)),
+                    'dense_rank': rank
+                }
+        
+        # Process sparse results
+        if sparse_results and len(sparse_results) > 0:
+            for rank, hit in enumerate(sparse_results[0], 1):
+                chunk_id = hit['entity'].get('chunk_id', '')
+                sparse_ranks[chunk_id] = rank
+                
+                if chunk_id in all_chunks:
+                    all_chunks[chunk_id]['sparse_score'] = float(hit.get('distance', 0.0))
+                    all_chunks[chunk_id]['sparse_rank'] = rank
+                else:
+                    all_chunks[chunk_id] = {
+                        'chunk_id': chunk_id,
+                        'doc_id': hit['entity'].get('doc_id', ''),
+                        'doc_name': hit['entity'].get('doc_name', ''),
+                        'chunk_text': hit['entity'].get('chunk_text', ''),
+                        'sparse_score': float(hit.get('distance', 0.0)),
+                        'sparse_rank': rank
+                    }
+        
+        # Calculate RRF scores
+        for chunk_id, chunk_data in all_chunks.items():
+            dense_rank = dense_ranks.get(chunk_id, DENSE_TOP_K + 1)
+            sparse_rank = sparse_ranks.get(chunk_id, SPARSE_TOP_K + 1)
             
+            rrf_score = (1.0 / (RRF_K + dense_rank)) + (1.0 / (RRF_K + sparse_rank))
+            
+            chunk_data['rrf_score'] = rrf_score
+            chunk_data['dense_rank'] = dense_rank
+            chunk_data['sparse_rank'] = sparse_rank
+            chunk_data.setdefault('dense_score', 0.0)
+            chunk_data.setdefault('sparse_score', 0.0)
+        
+        # Sort by RRF score
+        fused_results = sorted(
+            all_chunks.values(),
+            key=lambda x: x['rrf_score'],
+            reverse=True
+        )
+        
+        return fused_results
+    
+    def cross_encoder_rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
+        """Rerank with cross-encoder"""
+        if not self.cross_encoder or not candidates:
+            return candidates
+        
+        pairs = [[query, c['chunk_text']] for c in candidates]
+        ce_scores = self.cross_encoder.predict(pairs, show_progress_bar=False)
+        
+        for candidate, score in zip(candidates, ce_scores):
+            candidate['cross_encoder_score'] = float(score)
+        
+        reranked = sorted(
+            candidates,
+            key=lambda x: x['cross_encoder_score'],
+            reverse=True
+        )
+        
+        return reranked
+    
+    def process_single_query(self, query_data: Tuple[str, str, np.ndarray, Dict]) -> Dict:
+        """Process single query"""
+        query_num, query_text, dense_vec, sparse_vec = query_data
+        
+        try:
+            # Hybrid search
+            fused_results = self.hybrid_search_single(query_text, dense_vec, sparse_vec)
+            
+            # Take top candidates
+            candidates = fused_results[:50]
+            
+            # Cross-encoder reranking
+            if USE_CROSS_ENCODER and candidates:
+                final_results = self.cross_encoder_rerank(query_text, candidates)[:FINAL_TOP_K]
+            else:
+                final_results = candidates[:FINAL_TOP_K]
+            
+            # Extract doc_ids
             doc_ids = []
             seen = set()
-            top_chunk_text = "Not found."
+            for result in final_results:
+                doc_name = result.get('doc_name', '')
+                if doc_name and doc_name not in seen:
+                    doc_ids.append(doc_name)
+                    seen.add(doc_name)
             
-            # NEW: Store detailed results for CSV
-            detailed_results = []
+            # Store for CSV
+            for rank, result in enumerate(final_results, 1):
+                self.csv_data.append({
+                    'query_num': query_num,
+                    'query_text': query_text,
+                    'rank': rank,
+                    'chunk_id': result.get('chunk_id', ''),
+                    'doc_id': result.get('doc_id', ''),
+                    'doc_name': result.get('doc_name', ''),
+                    'rrf_score': result.get('rrf_score', 0.0),
+                    'cosine_score': result.get('dense_score', 0.0),
+                    'bm25_score': result.get('sparse_score', 0.0),
+                    'cosine_rank': result.get('dense_rank', 999),
+                    'bm25_rank': result.get('sparse_rank', 999),
+                    'cross_encoder_score': result.get('cross_encoder_score', 0.0),
+                    'chunk_text': result.get('chunk_text', '')[:500]
+                })
             
-            if results and len(results) > 0 and len(results[0]) > 0:
-                top_chunk_text = results[0][0]['entity'].get('chunk_text', 'Text field missing.')
-
-                for rank, hit in enumerate(results[0], 1):
-                    doc_id = hit['entity'].get('doc_id', '')
-                    chunk_id = hit['entity'].get('chunk_id', '')
-                    chunk_text = hit['entity'].get('chunk_text', '')
-                    
-                    # Get similarity score (distance in Milvus is 1 - cosine_similarity for COSINE metric)
-                    distance = hit.get('distance', 0.0)
-                    cosine_similarity = distance  # For COSINE metric, distance IS the similarity
-                    
-                    if doc_id and doc_id not in seen:
-                        doc_ids.append(doc_id)
-                        seen.add(doc_id)
-                    
-                    # NEW: Store for CSV
-                    detailed_results.append({
-                        'rank': rank,
-                        'chunk_id': chunk_id,
-                        'doc_id': doc_id,
-                        'cosine_similarity': cosine_similarity,
-                        'chunk_text': chunk_text
-                    })
+            sparse_hit_count = sum(1 for r in final_results if r.get('sparse_rank', 999) <= SPARSE_TOP_K)
+            logger.info(f"✓ Query {query_num}: {len(doc_ids)} docs | Sparse: {sparse_hit_count}/{len(final_results)}")
             
             return {
                 "query_num": query_num,
                 "query_text": query_text,
                 "doc_ids": doc_ids,
-                "top_chunk_text": top_chunk_text,
-                "detailed_results": detailed_results,  # NEW
                 "success": True
             }
             
         except Exception as e:
-            logger.error(f"Search failed for query {query_num}: {e}")
+            logger.error(f"✗ Query {query_num} failed: {e}")
             return {
                 "query_num": query_num,
                 "query_text": query_text,
                 "doc_ids": [],
-                "top_chunk_text": f"Error during search: {e}",
-                "detailed_results": [],  # NEW
                 "success": False,
                 "error": str(e)
             }
     
-    def search_parallel_batch(self, embedded_queries: List[Tuple[str, str, np.ndarray]]) -> List[Dict]:
-        logger.info(f"Searching {len(embedded_queries)} queries in parallel...")
+    def search_parallel_batch(self, embedded_queries: List) -> List[Dict]:
+        """Search in parallel"""
+        logger.info(f"Searching {len(embedded_queries)} queries...")
         start_time = time.time()
         
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_query = {
-                executor.submit(self.search_single_query, query_data): query_data[0]
+            futures = {
+                executor.submit(self.process_single_query, query_data): query_data[0]
                 for query_data in embedded_queries
             }
             
-            for future in as_completed(future_to_query):
+            for future in as_completed(futures):
                 try:
                     result = future.result()
                     results.append(result)
-                    
-                    logger.info(f"\n[RESULT FOR QUERY #{result['query_num']}]")
-                    logger.info(f"  QUERY: {result['query_text']}")
-                    logger.info(f"  TOP CHUNK: {result['top_chunk_text'][:400]}...")
-                    
-                    # NEW: Store in CSV data
-                    for detail in result.get('detailed_results', []):
-                        self.csv_data.append({
-                            'query_num': result['query_num'],
-                            'query_text': result['query_text'],
-                            'rank': detail['rank'],
-                            'chunk_id': detail['chunk_id'],
-                            'doc_id': detail['doc_id'],
-                            'cosine_similarity': detail['cosine_similarity'],
-                            'chunk_text': detail['chunk_text'][:500]  # Truncate for CSV
-                        })
-                    
                 except Exception as e:
-                    query_num = future_to_query[future]
-                    logger.error(f"Query {query_num} failed: {e}")
+                    logger.error(f"Query failed: {e}")
         
         duration = time.time() - start_time
-        speed = len(embedded_queries) / duration if duration > 0 else 0
-        logger.info(f"Searched {len(embedded_queries)} queries in {duration:.2f}s ({speed:.1f} queries/sec)")
+        logger.info(f"✓ Searched in {duration:.2f}s ({len(embedded_queries)/duration:.1f} q/s)")
         
         return results
     
     def write_result_file(self, result: Dict, output_path: Path) -> bool:
+        """Write JSON result"""
         try:
             output_data = {
                 "query": result["query_text"],
@@ -259,62 +459,37 @@ class OptimizedBatchQueryProcessor:
             output_file = output_path / f"query_{result['query_num']}.json"
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(output_data, f, indent=4)
-            
             return True
         except Exception as e:
-            logger.error(f"Failed to write result for query {result['query_num']}: {e}")
+            logger.error(f"Write failed: {e}")
             return False
     
-    def write_results_parallel(self, results: List[Dict], output_path: Path) -> int:
-        logger.info(f"Writing {len(results)} result files...")
-        start_time = time.time()
-        
-        success_count = 0
-        with ThreadPoolExecutor(max_workers=WRITE_WORKERS) as executor:
-            futures = [
-                executor.submit(self.write_result_file, result, output_path)
-                for result in results
-            ]
-            
-            for future in as_completed(futures):
-                if future.result():
-                    success_count += 1
-        
-        duration = time.time() - start_time
-        logger.info(f"Wrote {success_count}/{len(results)} files in {duration:.2f}s")
-        
-        return success_count
-    
     def write_csv_results(self):
-        """NEW: Write all search results to CSV"""
-        logger.info(f"Writing CSV results to {CSV_OUTPUT}...")
+        """Write CSV"""
+        logger.info(f"Writing CSV to {CSV_OUTPUT}...")
         
         try:
             with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = [
-                    'query_num', 'query_text', 'rank', 'chunk_id', 
-                    'doc_id', 'cosine_similarity', 'chunk_text'
+                    'query_num', 'query_text', 'rank', 'chunk_id', 'doc_id', 'doc_name',
+                    'rrf_score', 'cosine_score', 'bm25_score', 'cosine_rank', 'bm25_rank',
+                    'cross_encoder_score', 'chunk_text'
                 ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                
                 writer.writeheader()
                 writer.writerows(self.csv_data)
             
-            logger.info(f"✅ CSV written successfully: {len(self.csv_data)} rows")
+            logger.info(f"✓ CSV written: {len(self.csv_data)} rows")
         except Exception as e:
-            logger.error(f"Failed to write CSV: {e}")
+            logger.error(f"CSV write failed: {e}")
     
     def process_all_queries(self):
+        """Main processing"""
         start_time = time.time()
         
-        logger.info(f"Loading queries from {QUERIES_FILE}...")
+        # Load queries
         with open(QUERIES_FILE, 'r', encoding='utf-8') as f:
             queries_data = json.load(f)
-        
-        logger.info(f"Loaded {len(queries_data)} queries")
-        
-        output_path = Path(OUTPUT_DIR)
-        output_path.mkdir(exist_ok=True)
         
         queries = [
             (item.get("query_num"), item.get("query"))
@@ -322,64 +497,79 @@ class OptimizedBatchQueryProcessor:
             if item.get("query_num") and item.get("query")
         ]
         
-        logger.info(f"Processing {len(queries)} valid queries")
+        logger.info(f"Processing {len(queries)} queries")
         
+        # Create output dir
+        output_path = Path(OUTPUT_DIR)
+        output_path.mkdir(exist_ok=True)
+        
+        # Process in batches
         all_results = []
-        total_queries = len(queries)
         
-        for batch_start in range(0, total_queries, EMBEDDING_BATCH_SIZE):
-            batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, total_queries)
+        for batch_start in range(0, len(queries), EMBEDDING_BATCH_SIZE):
+            batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, len(queries))
             batch_queries = queries[batch_start:batch_end]
             
-            batch_num = (batch_start // EMBEDDING_BATCH_SIZE) + 1
-            total_batches = (total_queries + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Batch {batch_start+1}-{batch_end}:")
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing batch {batch_num}/{total_batches} (queries {batch_start+1}-{batch_end})")
-            
+            # Embed (both dense and sparse)
             embedded_queries = self.embed_queries_batch(batch_queries)
+            
+            # Search
             batch_results = self.search_parallel_batch(embedded_queries)
-            self.write_results_parallel(batch_results, output_path)
+            
+            # Write results
+            for result in batch_results:
+                self.write_result_file(result, output_path)
             
             all_results.extend(batch_results)
-            
-            processed = len(all_results)
-            elapsed = time.time() - start_time
-            speed = processed / elapsed if elapsed > 0 else 0
-            remaining = total_queries - processed
-            eta = remaining / speed if speed > 0 else 0
-            
-            logger.info(f"Progress: {processed}/{total_queries} ({100*processed/total_queries:.1f}%)")
-            logger.info(f"Speed: {speed:.1f} queries/sec | ETA: {eta/60:.1f} minutes")
         
-        # NEW: Write CSV before creating zip
+        # Write CSV
         self.write_csv_results()
         
-        logger.info(f"\nCreating submission zip: {ZIP_FILENAME}")
-        json_files = list(output_path.glob("*.json"))
-        
+        # Create zip
+        logger.info(f"\nCreating {ZIP_FILENAME}...")
         with zipfile.ZipFile(ZIP_FILENAME, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file_path in json_files:
-                zf.write(file_path, arcname=file_path.name)
+            for file in output_path.glob("*.json"):
+                zf.write(file, arcname=file.name)
         
+        # Stats
         total_time = time.time() - start_time
         success_count = sum(1 for r in all_results if r["success"])
         
-        logger.info(f"\n{'='*60}")
-        logger.info("BATCH PROCESSING COMPLETE")
-        logger.info(f"Total time: {total_time/60:.2f} minutes")
-        logger.info(f"Average speed: {total_queries/total_time:.1f} queries/sec")
-        logger.info(f"Output: {ZIP_FILENAME}")
-        logger.info(f"CSV Output: {CSV_OUTPUT}")
-        logger.info(f"{'='*60}")
+        # Analyze sparse usage
+        sparse_hits = sum(
+            1 for row in self.csv_data 
+            if row['bm25_rank'] <= SPARSE_TOP_K
+        )
+        total_rows = len(self.csv_data)
+        sparse_percentage = (sparse_hits / total_rows * 100) if total_rows > 0 else 0
+        
+        # Analyze sparse contribution to top-1
+        top1_with_sparse = sum(
+            1 for row in self.csv_data
+            if row['rank'] == 1 and row['bm25_rank'] <= SPARSE_TOP_K
+        )
+        
+        logger.info(f"\n{'='*70}")
+        logger.info("HYBRID SEARCH COMPLETE")
+        logger.info(f"Total: {len(queries)} | Success: {success_count} | Failed: {len(queries)-success_count}")
+        logger.info(f"Time: {total_time/60:.2f} min | Speed: {len(queries)/total_time:.2f} q/s")
+        logger.info(f"Sparse effectiveness: {sparse_percentage:.1f}% ({sparse_hits}/{total_rows} results)")
+        logger.info(f"Sparse in top-1: {top1_with_sparse}/{len(queries)} queries")
+        logger.info(f"Output: {ZIP_FILENAME} | CSV: {CSV_OUTPUT}")
+        logger.info(f"{'='*70}")
 
-def run_batch_queries():
+
+def main():
     try:
-        processor = OptimizedBatchQueryProcessor()
+        processor = FixedHybridQueryProcessor()
         processor.process_all_queries()
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         raise
 
+
 if __name__ == "__main__":
-    run_batch_queries()
+    main()

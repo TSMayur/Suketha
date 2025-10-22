@@ -16,7 +16,7 @@ COLLECTION_NAME = "rag_chunks_hybrid"
 def create_hybrid_collection():
     """Create collection with both dense and sparse vector fields"""
     
-    client = MilvusClient(uri="http://localhost:19530")
+    client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
     
     # Drop existing collection if it exists
     if client.has_collection(COLLECTION_NAME):
@@ -98,7 +98,7 @@ def create_hybrid_collection():
 
 def verify_collection():
     """Verify the collection was created correctly"""
-    client = MilvusClient(uri="http://localhost:19530")
+    client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
     
     if not client.has_collection(COLLECTION_NAME):
         logger.error(f"❌ Collection '{COLLECTION_NAME}' not found!")
