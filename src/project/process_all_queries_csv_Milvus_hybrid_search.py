@@ -1,69 +1,79 @@
-# src/project/process_all_queries.py
 """
-OPTIMIZED v4: Milvus Native Hybrid Search with Parallel Processing + CSV
-Based on: https://milvus.io/docs/hybrid_search_with_milvus.md
-
-Key Features:
-1. Native Milvus hybrid_search() API (10x faster)
-2. AnnSearchRequest + WeightedRanker for optimal fusion
-3. Parallel batch processing for maximum speed
-4. Cross-encoder reranking for accuracy
-5. Comprehensive CSV output with all scores
-6. SHA256 deterministic sparse vectors
+100% MATCHING Milvus Documentation Format
+- Exact same search patterns as official docs
+- Same metric types, params, request order
+- Using mpnet for embeddings (as requested)
+- Custom sparse vectors (SHA256 hash-based)
 """
 
 import json
 import zipfile
 import logging
-import csv
 import hashlib
+import gc
+import psutil
+import csv
 from pathlib import Path
 from typing import List, Dict, Tuple, Set
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pymilvus import (
-    MilvusClient,
-    Collection,
     connections,
+    utility,
+    Collection,
     AnnSearchRequest,
     WeightedRanker,
 )
 from sentence_transformers import SentenceTransformer, CrossEncoder
-import numpy as np
+import torch
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-QUERIES_FILE = '1.json'
-OUTPUT_DIR = 'submission_hybrid_milvus'
-ZIP_FILENAME = 'MILVUS_HYBRID_search.zip'
-CSV_OUTPUT = 'milvus_hybrid_search_results.csv'
+# File paths
+QUERIES_FILE = 'random_1000_queries.json'
+OUTPUT_DIR = 'subm'
+ZIP_FILENAME = 'PS04.zip'
+CSV_OUTPUT = 'new_milvus.csv'
 
-MILVUS_URI = "http://localhost:19530"
+# Milvus connection
+MILVUS_URI = "http://4.213.199.69:19530"
+TOKEN = "SecurePassword123"
 COLLECTION_NAME = "rag_chunks_hybrid"
+
+# Models
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-
-# Search parameters
-SEARCH_LIMIT = 50   # Candidates for reranking
-FINAL_TOP_K = 5     # Final results to return
-
-# Hybrid search weights (tune for best results)
-SPARSE_WEIGHT = 0.7  # BM25/keyword matching
-DENSE_WEIGHT = 1.0   # Semantic similarity
-
-# Cross-encoder
-USE_CROSS_ENCODER = True
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# Performance config
-EMBEDDING_BATCH_SIZE = 64
-MAX_WORKERS = 16
-WRITE_WORKERS = 4
+# Search parameters
+SEARCH_LIMIT = 50
+FINAL_TOP_K = 5
+
+# Hybrid search weights (same as docs)
+SPARSE_WEIGHT = 0.7
+DENSE_WEIGHT = 1.0
+
+# Feature flags
+USE_CROSS_ENCODER = True
+
+# Performance settings
+EMBEDDING_BATCH_SIZE = 36
+PROCESS_BATCH_SIZE = 72
+MAX_WORKERS = 12
+CROSS_ENCODER_BATCH = 36
 
 # Sparse vector config
 VOCAB_SIZE = 10_000_000
 MIN_TOKEN_LENGTH = 2
+
+# Memory management
+MEMORY_CHECK_INTERVAL = 25
+MAX_MEMORY_PERCENT = 75
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +81,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ============================================================================
-# UTILITIES
+# STOPWORDS
 # ============================================================================
 
 STOPWORDS: Set[str] = {
@@ -84,6 +93,9 @@ STOPWORDS: Set[str] = {
     'their', 'if', 'out', 'so', 'up', 'been', 'than', 'them', 'she',
 }
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def deterministic_token_hash(token: str, vocab_size: int) -> int:
     """SHA256-based deterministic hashing"""
@@ -99,461 +111,617 @@ def tokenize_text(text: str) -> List[str]:
     return tokens
 
 
+def generate_sparse_vector(text: str) -> Dict[int, float]:
+    """Generate deterministic sparse vector"""
+    tokens = tokenize_text(text)
+    if not tokens:
+        return {}
+    
+    term_freq = {}
+    for token in tokens:
+        token_id = deterministic_token_hash(token, VOCAB_SIZE)
+        term_freq[token_id] = term_freq.get(token_id, 0) + 1
+    
+    max_freq = max(term_freq.values())
+    normalized = {tid: freq / max_freq for tid, freq in term_freq.items()}
+    
+    return normalized
+
+
+def check_memory() -> Dict[str, float]:
+    """Check current memory usage"""
+    mem = psutil.virtual_memory()
+    return {
+        'percent': mem.percent,
+        'available_gb': mem.available / (1024**3),
+        'used_gb': mem.used / (1024**3),
+        'total_gb': mem.total / (1024**3)
+    }
+
+
+def aggressive_cleanup():
+    """Aggressive memory cleanup"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    for _ in range(3):
+        gc.collect()
+    
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except:
+        pass
+
+
 # ============================================================================
-# OPTIMIZED HYBRID QUERY PROCESSOR
+# MILVUS CONNECTION (100% SAME AS DOCS)
 # ============================================================================
 
-class OptimizedHybridQueryProcessor:
-    """
-    Fast hybrid search with parallel processing and CSV output
-    """
+def connect_to_milvus(uri: str, token: str = None):
+    """Connect to Milvus - exactly as docs"""
+    logger.info(f"Connecting to Milvus at {uri}")
+    if token:
+        connections.connect(uri=uri, token=token)
+    else:
+        connections.connect(uri=uri)
+    logger.info("✓ Connected to Milvus")
+
+
+def get_collection(collection_name: str) -> Collection:
+    """Get and load collection - exactly as docs"""
+    if not utility.has_collection(collection_name):
+        raise RuntimeError(f"Collection '{collection_name}' not found!")
     
-    def __init__(self):
-        logger.info("Initializing Optimized Hybrid Query Processor v4...")
-        logger.info("="*70)
-        
-        # Load embedding model
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        self.embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME,
-            device="cpu"
-        )
-        logger.info("✓ Embedding model loaded")
-        
-        # Load cross-encoder
-        if USE_CROSS_ENCODER:
-            logger.info(f"Loading cross-encoder: {CROSS_ENCODER_MODEL}")
-            self.cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-            logger.info("✓ Cross-encoder loaded")
-        else:
-            self.cross_encoder = None
-        
-        # Connect to Milvus
-        self._connect_to_milvus()
-        
-        # CSV storage
-        self.csv_data = []
-        
-        logger.info("="*70)
-        logger.info("✓ Initialization complete\n")
-    
-    def _connect_to_milvus(self, max_retries=5, retry_delay=3):
-        """Connect to Milvus with retry logic"""
-        logger.info(f"Connecting to Milvus at {MILVUS_URI}")
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Attempt {attempt}/{max_retries}...")
-                self.client = MilvusClient(uri=MILVUS_URI, timeout=30)
-                connections.connect("default", uri=MILVUS_URI, timeout=30)
-                break
-            except Exception as e:
-                logger.warning(f"Failed: {e}")
-                if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                else:
-                    raise RuntimeError(f"Connection failed after {max_retries} attempts") from e
-        
-        # Verify collection
-        logger.info("Checking collection...")
-        if not self.client.has_collection(COLLECTION_NAME):
-            available = self.client.list_collections()
-            raise RuntimeError(
-                f"Collection '{COLLECTION_NAME}' not found! Available: {available}"
-            )
-        
-        # Get collection object for hybrid search
-        self.collection = Collection(COLLECTION_NAME)
-        
-        # Verify schema
-        schema_info = self.client.describe_collection(COLLECTION_NAME)
-        has_dense = False
-        has_sparse = False
-        
-        logger.info("Schema:")
-        for field in schema_info['fields']:
-            field_name = field['name']
-            logger.info(f"  - {field_name}")
-            if field_name == "dense_vector":
-                has_dense = True
-            if field_name == "sparse_vector":
-                has_sparse = True
-        
-        if not (has_dense and has_sparse):
-            raise RuntimeError("Missing hybrid vectors!")
-        
-        # Load collection
-        logger.info("Loading collection...")
-        self.collection.load()
-        time.sleep(2)
-        
-        # Get stats
-        try:
-            stats = self.client.get_collection_stats(COLLECTION_NAME)
-            row_count = stats.get('row_count', 0)
-            logger.info(f"✓ Connected: {row_count:,} chunks")
-        except:
-            logger.info("✓ Connected")
-    
-    def generate_sparse_vector(self, text: str) -> Dict[int, float]:
-        """Generate deterministic sparse vector"""
-        tokens = tokenize_text(text)
-        if not tokens:
-            return {}
-        
-        term_freq = {}
-        for token in tokens:
-            token_id = deterministic_token_hash(token, VOCAB_SIZE)
-            term_freq[token_id] = term_freq.get(token_id, 0) + 1
-        
-        max_freq = max(term_freq.values())
-        sparse_vector = {
-            token_id: freq / max_freq
-            for token_id, freq in term_freq.items()
+    col = Collection(collection_name)
+    col.load()
+    logger.info(f"✓ Collection '{collection_name}' loaded")
+    return col
+
+
+# ============================================================================
+# SEARCH FUNCTIONS (100% MATCHING DOCS)
+# ============================================================================
+
+def dense_search(col, query_dense_embedding, limit=10):
+    """Dense search - EXACTLY as documentation"""
+    search_params = {"metric_type": "IP", "params": {}}
+    res = col.search(
+        [query_dense_embedding],
+        anns_field="dense_vector",
+        limit=limit,
+        output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"],
+        param=search_params,
+    )[0]
+    return [
+        {
+            'chunk_id': hit.entity.get('chunk_id', ''),
+            'doc_id': hit.entity.get('doc_id', ''),
+            'doc_name': hit.entity.get('doc_name', ''),
+            'chunk_text': hit.entity.get('chunk_text', ''),
+            'score': float(hit.score),
         }
-        
-        return sparse_vector
-    
-    def embed_queries_batch(self, queries: List[Tuple[str, str]]) -> List[Tuple[str, str, np.ndarray, Dict]]:
-        """
-        Batch embed queries for efficiency.
-        Returns: [(query_num, query_text, dense_vector, sparse_vector), ...]
-        """
-        query_nums = [q[0] for q in queries]
-        query_texts = [q[1] for q in queries]
-        
-        logger.info(f"Embedding batch of {len(query_texts)} queries...")
-        start_time = time.time()
-        
-        # Dense embeddings
-        dense_embeddings = self.embedding_model.encode(
-            query_texts,
-            batch_size=EMBEDDING_BATCH_SIZE,
+        for hit in res
+    ]
+
+
+def sparse_search(col, query_sparse_embedding, limit=10):
+    """Sparse search - EXACTLY as documentation"""
+    search_params = {
+        "metric_type": "IP",
+        "params": {},
+    }
+    res = col.search(
+        [query_sparse_embedding],
+        anns_field="sparse_vector",
+        limit=limit,
+        output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"],
+        param=search_params,
+    )[0]
+    return [
+        {
+            'chunk_id': hit.entity.get('chunk_id', ''),
+            'doc_id': hit.entity.get('doc_id', ''),
+            'doc_name': hit.entity.get('doc_name', ''),
+            'chunk_text': hit.entity.get('chunk_text', ''),
+            'score': float(hit.score),
+        }
+        for hit in res
+    ]
+
+
+def hybrid_search(
+    col,
+    query_dense_embedding,
+    query_sparse_embedding,
+    sparse_weight=1.0,
+    dense_weight=1.0,
+    limit=10,
+):
+    """Hybrid search - EXACTLY as documentation"""
+    dense_search_params = {"metric_type": "IP", "params": {}}
+    dense_req = AnnSearchRequest(
+        [query_dense_embedding], "dense_vector", dense_search_params, limit=limit
+    )
+    sparse_search_params = {"metric_type": "IP", "params": {}}
+    sparse_req = AnnSearchRequest(
+        [query_sparse_embedding], "sparse_vector", sparse_search_params, limit=limit
+    )
+    rerank = WeightedRanker(sparse_weight, dense_weight)
+    res = col.hybrid_search(
+        [sparse_req, dense_req], rerank=rerank, limit=limit, output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
+    )[0]
+    return [
+        {
+            'chunk_id': hit.entity.get('chunk_id', ''),
+            'doc_id': hit.entity.get('doc_id', ''),
+            'doc_name': hit.entity.get('doc_name', ''),
+            'chunk_text': hit.entity.get('chunk_text', ''),
+            'score': float(hit.score),
+        }
+        for hit in res
+    ]
+
+
+# ============================================================================
+# EMBEDDING GENERATION
+# ============================================================================
+
+def load_embedding_model(model_name: str) -> SentenceTransformer:
+    """Load sentence transformer model"""
+    logger.info(f"Loading embedding model: {model_name}")
+    model = SentenceTransformer(model_name, device="cpu")
+    model.eval()
+    logger.info("✓ Embedding model loaded")
+    return model
+
+
+def load_cross_encoder(model_name: str) -> CrossEncoder:
+    """Load cross-encoder model"""
+    logger.info(f"Loading cross-encoder: {model_name}")
+    model = CrossEncoder(model_name, device="cpu")
+    logger.info("✓ Cross-encoder loaded")
+    return model
+
+
+def generate_embeddings(
+    embedding_model: SentenceTransformer,
+    texts: List[str],
+    batch_size: int = 24
+) -> List[List[float]]:
+    """Generate dense embeddings"""
+    with torch.no_grad():
+        embeddings = embedding_model.encode(
+            texts,
+            batch_size=batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True
         )
-        
-        # Sparse embeddings
-        sparse_embeddings = [self.generate_sparse_vector(text) for text in query_texts]
-        
-        duration = time.time() - start_time
-        speed = len(query_texts) / duration
-        logger.info(f"✓ Embedded {len(query_texts)} queries in {duration:.2f}s ({speed:.1f} q/s)")
-        
-        return list(zip(query_nums, query_texts, dense_embeddings, sparse_embeddings))
     
-    def hybrid_search_native(
-        self,
-        query_text: str,
-        dense_vector: np.ndarray,
-        sparse_vector: Dict[int, float]
-    ) -> List[Dict]:
-        """
-        ⭐ OPTIMIZED: Native Milvus hybrid_search() API
-        
-        - Single API call (10x faster than manual RRF)
-        - Native C++ implementation
-        - Optimized WeightedRanker
-        """
-        # Dense search request
-        dense_search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
-        dense_req = AnnSearchRequest(
-            data=[dense_vector.tolist() if isinstance(dense_vector, np.ndarray) else dense_vector],
-            anns_field="dense_vector",
-            param=dense_search_params,
+    return embeddings.tolist()
+
+
+# ============================================================================
+# CROSS-ENCODER RERANKING
+# ============================================================================
+
+def cross_encoder_rerank(
+    cross_encoder: CrossEncoder,
+    query: str,
+    candidates: List[Dict],
+    batch_size: int = 24
+) -> List[Dict]:
+    """Rerank using cross-encoder"""
+    if not candidates:
+        return []
+    
+    pairs = [[query, c['chunk_text']] for c in candidates]
+    
+    with torch.no_grad():
+        scores = cross_encoder.predict(
+            pairs,
+            batch_size=batch_size,
+            show_progress_bar=False
+        )
+    
+    for candidate, score in zip(candidates, scores):
+        candidate['cross_encoder_score'] = float(score)
+    
+    reranked = sorted(candidates, key=lambda x: x['cross_encoder_score'], reverse=True)
+    
+    return reranked
+
+
+# ============================================================================
+# BATCH PROCESSING
+# ============================================================================
+
+def process_single_query(
+    col: Collection,
+    query_num: str,
+    query_text: str,
+    dense_embedding: List[float],
+    sparse_embedding: Dict[int, float]
+) -> Dict:
+    """Process a single query using hybrid search"""
+    try:
+        # Use hybrid_search function (same as docs)
+        results = hybrid_search(
+            col,
+            dense_embedding,
+            sparse_embedding,
+            sparse_weight=SPARSE_WEIGHT,
+            dense_weight=DENSE_WEIGHT,
             limit=SEARCH_LIMIT
         )
         
-        # Sparse search request
-        sparse_search_params = {"metric_type": "IP", "params": {}}
-        sparse_req = AnnSearchRequest(
-            data=[sparse_vector],
-            anns_field="sparse_vector",
-            param=sparse_search_params,
-            limit=SEARCH_LIMIT
+        return {
+            "query_num": query_num,
+            "query_text": query_text,
+            "candidates": results,
+            "success": True
+        }
+        
+    except Exception as e:
+        logger.error(f"✗ Query {query_num} failed: {e}")
+        return {
+            "query_num": query_num,
+            "query_text": query_text,
+            "candidates": [],
+            "success": False,
+            "error": str(e)
+        }
+
+
+def process_queries_parallel(
+    col: Collection,
+    queries_data: List[Tuple[str, str, List[float], Dict[int, float]]],
+    max_workers: int = 12
+) -> List[Dict]:
+    """Process queries in parallel"""
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                process_single_query,
+                col,
+                query_num,
+                query_text,
+                dense_emb,
+                sparse_emb
+            ): query_num
+            for query_num, query_text, dense_emb, sparse_emb in queries_data
+        }
+        
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=30)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Query processing failed: {e}")
+    
+    return results
+
+
+# ============================================================================
+# RESULT FINALIZATION
+# ============================================================================
+
+def finalize_results_with_reranking(
+    cross_encoder: CrossEncoder,
+    results: List[Dict],
+    csv_data: List[Dict]
+) -> List[Dict]:
+    """Apply cross-encoder reranking and extract top-K doc_ids"""
+    for result in results:
+        if not result['success'] or not result.get('candidates'):
+            result['doc_ids'] = []
+            continue
+        
+        # Rerank
+        reranked = cross_encoder_rerank(
+            cross_encoder,
+            result['query_text'],
+            result['candidates'],
+            batch_size=CROSS_ENCODER_BATCH
         )
         
-        # Weighted ranker for fusion
-        reranker = WeightedRanker(SPARSE_WEIGHT, DENSE_WEIGHT)
+        # Take top-K
+        top_k = reranked[:FINAL_TOP_K]
         
-        # ⭐ Single hybrid search call (FAST!)
-        results = self.collection.hybrid_search(
-            reqs=[sparse_req, dense_req],
-            rerank=reranker,
-            limit=SEARCH_LIMIT,
-            output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
-        )[0]
+        # Extract unique doc_ids
+        doc_ids = []
+        seen = set()
+        for candidate in top_k:
+            doc_name = candidate.get('doc_name', '')
+            if doc_name and doc_name not in seen:
+                doc_ids.append(doc_name)
+                seen.add(doc_name)
         
-        # Convert to dict format
-        formatted_results = []
-        for rank, hit in enumerate(results, 1):
-            formatted_results.append({
-                'chunk_id': hit.entity.get('chunk_id', ''),
-                'doc_id': hit.entity.get('doc_id', ''),
-                'doc_name': hit.entity.get('doc_name', ''),
-                'chunk_text': hit.entity.get('chunk_text', ''),
-                'hybrid_score': float(hit.score),
-                'rank': rank
+        result['doc_ids'] = doc_ids
+        
+        # Collect CSV data
+        for rank, candidate in enumerate(reranked, 1):
+            csv_data.append({
+                'query_num': result['query_num'],
+                'query_text': result['query_text'],
+                'rank': rank,
+                'chunk_id': candidate.get('chunk_id', ''),
+                'doc_id': candidate.get('doc_id', ''),
+                'doc_name': candidate.get('doc_name', ''),
+                'hybrid_score': candidate.get('score', 0.0),
+                'cross_encoder_score': candidate.get('cross_encoder_score', 0.0),
+                'chunk_text': candidate.get('chunk_text', '')[:500]
             })
         
-        return formatted_results
+        result['candidates'] = None
     
-    def cross_encoder_rerank(
-        self,
-        query: str,
-        candidates: List[Dict]
-    ) -> List[Dict]:
-        """Cross-encoder reranking for accuracy"""
-        if not self.cross_encoder or not candidates:
-            return candidates
+    return results
+
+
+def finalize_results_without_reranking(
+    results: List[Dict],
+    csv_data: List[Dict]
+) -> List[Dict]:
+    """Extract top-K doc_ids without reranking"""
+    for result in results:
+        if not result['success'] or not result.get('candidates'):
+            result['doc_ids'] = []
+            continue
         
-        pairs = [[query, c['chunk_text']] for c in candidates]
-        ce_scores = self.cross_encoder.predict(pairs, show_progress_bar=False)
+        candidates = result['candidates'][:FINAL_TOP_K]
         
-        for candidate, score in zip(candidates, ce_scores):
-            candidate['cross_encoder_score'] = float(score)
+        # Extract unique doc_ids
+        doc_ids = []
+        seen = set()
+        for candidate in candidates:
+            doc_name = candidate.get('doc_name', '')
+            if doc_name and doc_name not in seen:
+                doc_ids.append(doc_name)
+                seen.add(doc_name)
         
-        reranked = sorted(
-            candidates,
-            key=lambda x: x['cross_encoder_score'],
-            reverse=True
-        )
+        result['doc_ids'] = doc_ids
         
-        return reranked
+        # Collect CSV data
+        for rank, candidate in enumerate(result['candidates'], 1):
+            csv_data.append({
+                'query_num': result['query_num'],
+                'query_text': result['query_text'],
+                'rank': rank,
+                'chunk_id': candidate.get('chunk_id', ''),
+                'doc_id': candidate.get('doc_id', ''),
+                'doc_name': candidate.get('doc_name', ''),
+                'hybrid_score': candidate.get('score', 0.0),
+                'cross_encoder_score': 0.0,
+                'chunk_text': candidate.get('chunk_text', '')[:500]
+            })
+        
+        result['candidates'] = None
     
-    def process_single_query(self, query_data: Tuple[str, str, np.ndarray, Dict]) -> Dict:
-        """Process single query"""
-        query_num, query_text, dense_vec, sparse_vec = query_data
-        
-        try:
-            # Native hybrid search (FAST!)
-            hybrid_results = self.hybrid_search_native(query_text, dense_vec, sparse_vec)
-            
-            # Cross-encoder reranking (optional)
-            if USE_CROSS_ENCODER and hybrid_results:
-                final_results = self.cross_encoder_rerank(query_text, hybrid_results)[:FINAL_TOP_K]
-            else:
-                final_results = hybrid_results[:FINAL_TOP_K]
-            
-            # Extract doc_ids
-            doc_ids = []
-            seen = set()
-            for result in final_results:
-                doc_name = result.get('doc_name', '')
-                if doc_name and doc_name not in seen:
-                    doc_ids.append(doc_name)
-                    seen.add(doc_name)
-            
-            # Store for CSV
-            for rank, result in enumerate(final_results, 1):
-                self.csv_data.append({
-                    'query_num': query_num,
-                    'query_text': query_text,
-                    'rank': rank,
-                    'chunk_id': result.get('chunk_id', ''),
-                    'doc_id': result.get('doc_id', ''),
-                    'doc_name': result.get('doc_name', ''),
-                    'hybrid_score': result.get('hybrid_score', 0.0),
-                    'cross_encoder_score': result.get('cross_encoder_score', 0.0),
-                    'chunk_text': result.get('chunk_text', '')[:500]
-                })
-            
-            logger.info(f"✓ Query {query_num}: {len(doc_ids)} docs")
-            
-            return {
-                "query_num": query_num,
-                "query_text": query_text,
-                "doc_ids": doc_ids,
-                "success": True
-            }
-            
-        except Exception as e:
-            logger.error(f"✗ Query {query_num} failed: {e}")
-            return {
-                "query_num": query_num,
-                "query_text": query_text,
-                "doc_ids": [],
-                "success": False,
-                "error": str(e)
-            }
+    return results
+
+
+# ============================================================================
+# OUTPUT FUNCTIONS
+# ============================================================================
+
+def write_results_to_json(results: List[Dict], output_dir: Path):
+    """Write results to individual JSON files"""
+    output_dir.mkdir(exist_ok=True)
     
-    def search_parallel_batch(self, embedded_queries: List) -> List[Dict]:
-        """Search queries in parallel"""
-        logger.info(f"Searching {len(embedded_queries)} queries in parallel...")
-        start_time = time.time()
-        
-        results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_query = {
-                executor.submit(self.process_single_query, query_data): query_data[0]
-                for query_data in embedded_queries
-            }
-            
-            for future in as_completed(future_to_query):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    query_num = future_to_query[future]
-                    logger.error(f"✗ Query {query_num}: {e}")
-        
-        duration = time.time() - start_time
-        speed = len(embedded_queries) / duration if duration > 0 else 0
-        logger.info(f"✓ Searched {len(embedded_queries)} queries in {duration:.2f}s ({speed:.1f} q/s)")
-        
-        return results
-    
-    def write_result_file(self, result: Dict, output_path: Path) -> bool:
-        """Write result to JSON"""
+    for result in results:
         try:
             output_data = {
                 "query": result["query_text"],
-                "response": result["doc_ids"]
+                "response": result.get("doc_ids", [])
             }
             
-            output_file = output_path / f"query_{result['query_num']}.json"
+            output_file = output_dir / f"query_{result['query_num']}.json"
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(output_data, f, indent=4)
-            return True
         except Exception as e:
-            logger.error(f"Write failed: {e}")
-            return False
-    
-    def write_results_parallel(self, results: List[Dict], output_path: Path) -> int:
-        """Write result files in parallel"""
-        logger.info(f"Writing {len(results)} result files...")
-        start_time = time.time()
-        
-        success_count = 0
-        with ThreadPoolExecutor(max_workers=WRITE_WORKERS) as executor:
-            futures = [
-                executor.submit(self.write_result_file, result, output_path)
-                for result in results
-            ]
-            
-            for future in as_completed(futures):
-                if future.result():
-                    success_count += 1
-        
-        duration = time.time() - start_time
-        logger.info(f"✓ Wrote {success_count}/{len(results)} files in {duration:.2f}s")
-        
-        return success_count
-    
-    def write_csv_results(self):
-        """Write comprehensive CSV with all scores"""
-        logger.info(f"Writing CSV to {CSV_OUTPUT}...")
-        
-        try:
-            with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = [
-                    'query_num', 'query_text', 'rank', 'chunk_id', 'doc_id', 'doc_name',
-                    'hybrid_score', 'cross_encoder_score', 'chunk_text'
-                ]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self.csv_data)
-            
-            logger.info(f"✓ CSV written: {len(self.csv_data)} rows")
-        except Exception as e:
-            logger.error(f"CSV write failed: {e}")
-    
-    def process_all_queries(self):
-        """Main processing pipeline"""
-        start_time = time.time()
-        
-        # Load queries
-        logger.info(f"Loading queries from {QUERIES_FILE}...")
-        with open(QUERIES_FILE, 'r', encoding='utf-8') as f:
-            queries_data = json.load(f)
-        
-        queries = [
-            (item.get("query_num"), item.get("query"))
-            for item in queries_data
-            if item.get("query_num") and item.get("query")
-        ]
-        
-        logger.info(f"Processing {len(queries)} queries")
-        logger.info(f"Strategy: Native Hybrid Search + Cross-Encoder + Parallel")
-        logger.info(f"Weights: Sparse={SPARSE_WEIGHT}, Dense={DENSE_WEIGHT}")
-        logger.info("="*70)
-        
-        # Create output dir
-        output_path = Path(OUTPUT_DIR)
-        output_path.mkdir(exist_ok=True)
-        
-        # Process in batches
-        all_results = []
-        total_queries = len(queries)
-        
-        for batch_start in range(0, total_queries, EMBEDDING_BATCH_SIZE):
-            batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, total_queries)
-            batch_queries = queries[batch_start:batch_end]
-            
-            batch_num = (batch_start // EMBEDDING_BATCH_SIZE) + 1
-            total_batches = (total_queries + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
-            
-            logger.info(f"\n{'='*70}")
-            logger.info(f"BATCH {batch_num}/{total_batches} (queries {batch_start+1}-{batch_end})")
-            logger.info(f"{'='*70}")
-            
-            # Embed batch
-            embedded_queries = self.embed_queries_batch(batch_queries)
-            
-            # Search in parallel
-            batch_results = self.search_parallel_batch(embedded_queries)
-            
-            # Write results in parallel
-            self.write_results_parallel(batch_results, output_path)
-            
-            all_results.extend(batch_results)
-            
-            # Progress
-            processed = len(all_results)
-            elapsed = time.time() - start_time
-            speed = processed / elapsed if elapsed > 0 else 0
-            remaining = total_queries - processed
-            eta = remaining / speed if speed > 0 else 0
-            
-            logger.info(f"\nProgress: {processed}/{total_queries} ({100*processed/total_queries:.1f}%)")
-            logger.info(f"Speed: {speed:.1f} q/s | ETA: {eta/60:.1f} min")
-        
-        # Write CSV
-        self.write_csv_results()
-        
-        # Create zip
-        logger.info(f"\nCreating {ZIP_FILENAME}...")
-        json_files = list(output_path.glob("*.json"))
-        
-        with zipfile.ZipFile(ZIP_FILENAME, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file_path in json_files:
-                zf.write(file_path, arcname=file_path.name)
-        
-        # Stats
-        total_time = time.time() - start_time
-        success_count = sum(1 for r in all_results if r["success"])
-        
-        logger.info(f"\n{'='*70}")
-        logger.info("OPTIMIZED HYBRID SEARCH COMPLETE")
-        logger.info(f"{'='*70}")
-        logger.info(f"Method: Native hybrid_search() + WeightedRanker + Parallel")
-        logger.info(f"Total: {len(queries)} | Success: {success_count} | Failed: {len(queries)-success_count}")
-        logger.info(f"Time: {total_time/60:.2f} min | Speed: {len(queries)/total_time:.2f} q/s")
-        logger.info(f"Output ZIP: {ZIP_FILENAME}")
-        logger.info(f"Output CSV: {CSV_OUTPUT}")
-        logger.info(f"{'='*70}")
+            logger.error(f"Write failed for query {result.get('query_num')}: {e}")
 
+
+def write_csv_results(csv_data: List[Dict], csv_file: str):
+    """Write all search results to CSV"""
+    logger.info(f"\n📊 Writing CSV results to {csv_file}...")
+    
+    try:
+        sorted_data = sorted(csv_data, key=lambda x: (int(x['query_num']), x['rank']))
+        
+        with open(csv_file, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = [
+                'query_num', 'query_text', 'rank', 'chunk_id',
+                'doc_id', 'doc_name', 'hybrid_score', 'cross_encoder_score',
+                'chunk_text'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            writer.writerows(sorted_data)
+        
+        logger.info(f"✅ CSV written: {len(sorted_data)} rows")
+    except Exception as e:
+        logger.error(f"❌ Failed to write CSV: {e}")
+
+
+def create_submission_zip(output_dir: Path, zip_file: str):
+    """Create submission ZIP file"""
+    logger.info(f"\n📦 Creating {zip_file}...")
+    
+    with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file in output_dir.glob("*.json"):
+            zf.write(file, arcname=file.name)
+    
+    logger.info(f"✓ ZIP created: {zip_file}")
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
 
 def main():
-    """Main entry point"""
+    """Main pipeline - 100% matching Milvus documentation pattern"""
+    pipeline_start = time.time()
+    initial_memory = check_memory()
+    
+    logger.info(f"\n{'='*70}")
+    logger.info("HYBRID SEARCH - 100% Milvus Documentation Format")
+    logger.info(f"{'='*70}")
+    logger.info(f"💾 Initial memory: {initial_memory['used_gb']:.1f}GB / {initial_memory['total_gb']:.1f}GB\n")
+    
+    # ========================================================================
+    # 1. LOAD QUERIES
+    # ========================================================================
+    logger.info("📂 Loading queries...")
+    with open(QUERIES_FILE, 'r', encoding='utf-8') as f:
+        queries_json = json.load(f)
+    
+    queries = [
+        (item.get("query_num"), item.get("query"))
+        for item in queries_json
+        if item.get("query_num") and item.get("query")
+    ]
+    
+    total_queries = len(queries)
+    logger.info(f"✓ Loaded {total_queries} queries\n")
+    
+    # ========================================================================
+    # 2. LOAD MODELS
+    # ========================================================================
+    embedding_model = load_embedding_model(EMBEDDING_MODEL_NAME)
+    
+    if USE_CROSS_ENCODER:
+        cross_encoder = load_cross_encoder(CROSS_ENCODER_MODEL)
+    else:
+        cross_encoder = None
+    
+    # ========================================================================
+    # 3. CONNECT TO MILVUS (same as docs)
+    # ========================================================================
+    connect_to_milvus(uri=MILVUS_URI, token=TOKEN)
+    col = get_collection(COLLECTION_NAME)
+    
+    # ========================================================================
+    # 4. PROCESS QUERIES IN BATCHES
+    # ========================================================================
+    logger.info(f"\n{'='*70}")
+    logger.info(f"PROCESSING {total_queries} QUERIES")
+    logger.info(f"Batch size: {PROCESS_BATCH_SIZE}")
+    logger.info(f"Workers: {MAX_WORKERS}")
+    logger.info(f"{'='*70}\n")
+    
+    output_dir = Path(OUTPUT_DIR)
+    all_results = []
+    csv_data = []
+    queries_processed = 0
+    
+    for batch_start in range(0, len(queries), PROCESS_BATCH_SIZE):
+        batch_end = min(batch_start + PROCESS_BATCH_SIZE, len(queries))
+        batch_queries = queries[batch_start:batch_end]
+        
+        batch_start_time = time.time()
+        logger.info(f"\n{'='*70}")
+        logger.info(f"BATCH: {batch_start+1}-{batch_end} ({len(batch_queries)} queries)")
+        logger.info(f"{'='*70}")
+        
+        # Generate embeddings for batch
+        query_nums = [q[0] for q in batch_queries]
+        query_texts = [q[1] for q in batch_queries]
+        
+        logger.info("Generating embeddings...")
+        dense_embeddings = generate_embeddings(embedding_model, query_texts, EMBEDDING_BATCH_SIZE)
+        sparse_embeddings = [generate_sparse_vector(text) for text in query_texts]
+        
+        # Prepare data for parallel processing
+        queries_data = [
+            (qnum, qtext, dense, sparse)
+            for qnum, qtext, dense, sparse in zip(
+                query_nums, query_texts, dense_embeddings, sparse_embeddings
+            )
+        ]
+        
+        # Search in parallel
+        logger.info("Searching...")
+        search_start = time.time()
+        batch_results = process_queries_parallel(col, queries_data, MAX_WORKERS)
+        search_time = time.time() - search_start
+        logger.info(f"  Search: {len(batch_queries)} queries in {search_time:.2f}s")
+        
+        # Rerank
+        if USE_CROSS_ENCODER:
+            logger.info("Reranking...")
+            batch_results = finalize_results_with_reranking(cross_encoder, batch_results, csv_data)
+        else:
+            batch_results = finalize_results_without_reranking(batch_results, csv_data)
+        
+        # Write results
+        write_results_to_json(batch_results, output_dir)
+        
+        all_results.extend(batch_results)
+        queries_processed += len(batch_queries)
+        
+        # Statistics
+        batch_time = time.time() - batch_start_time
+        elapsed = time.time() - pipeline_start
+        progress = queries_processed / total_queries * 100
+        overall_speed = queries_processed / elapsed
+        
+        logger.info(f"\n📊 Batch time: {batch_time:.2f}s")
+        logger.info(f"📊 Progress: {queries_processed}/{total_queries} ({progress:.1f}%)")
+        logger.info(f"⚡ Overall speed: {overall_speed:.2f} q/s")
+        
+        # Memory check
+        if queries_processed % MEMORY_CHECK_INTERVAL == 0:
+            mem = check_memory()
+            logger.info(f"💾 Memory: {mem['percent']:.1f}% ({mem['used_gb']:.1f}GB used)")
+            
+            if mem['percent'] > MAX_MEMORY_PERCENT:
+                logger.warning("⚠️  High memory! Running cleanup...")
+                aggressive_cleanup()
+        
+        # Cleanup
+        aggressive_cleanup()
+        del dense_embeddings, sparse_embeddings, queries_data, batch_results
+    
+    # ========================================================================
+    # 5. WRITE CSV AND CREATE ZIP
+    # ========================================================================
+    write_csv_results(csv_data, CSV_OUTPUT)
+    create_submission_zip(output_dir, ZIP_FILENAME)
+    
+    # ========================================================================
+    # 6. FINAL STATISTICS
+    # ========================================================================
+    total_time = time.time() - pipeline_start
+    success_count = sum(1 for r in all_results if r["success"])
+    final_mem = check_memory()
+    mem_growth = final_mem['used_gb'] - initial_memory['used_gb']
+    
+    logger.info(f"\n{'='*70}")
+    logger.info("✅ PIPELINE COMPLETE")
+    logger.info(f"{'='*70}")
+    logger.info(f"Queries: {total_queries} | Success: {success_count}")
+    logger.info(f"Time: {total_time/60:.2f} minutes")
+    logger.info(f"Speed: {total_queries/total_time:.2f} q/s")
+    logger.info(f"Memory growth: {mem_growth:.1f}GB")
+    logger.info(f"Output: {ZIP_FILENAME}")
+    logger.info(f"CSV: {CSV_OUTPUT} ({len(csv_data)} rows)")
+    logger.info(f"{'='*70}")
+    
+    # ========================================================================
+    # 7. CLEANUP
+    # ========================================================================
     try:
-        processor = OptimizedHybridQueryProcessor()
-        processor.process_all_queries()
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        raise
+        connections.disconnect("default")
+        logger.info("✓ Disconnected from Milvus")
+    except:
+        pass
+    aggressive_cleanup()
 
 
 if __name__ == "__main__":
