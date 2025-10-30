@@ -26,7 +26,7 @@ import sqlite3
 import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from pymilvus import MilvusClient
+from .config import client, COLLECTION_NAME
 
 from project.pydantic_models import ProcessingConfig, EmbeddingModel
 from project.doc_reader import DocumentReader
@@ -38,10 +38,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Milvus configuration
-COLLECTION_NAME = "rag_chunks_hybrid"
-
 
 def get_files_from_sqlite(db_path):
     """Get files from SQLite with pending status"""
@@ -94,9 +90,8 @@ class MilvusHybridPipeline:
     def _connect_to_milvus(self):
         """Connect to Milvus"""
         logger.info("Connecting to Milvus...")
-        self.milvus_client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
         
-        if not self.milvus_client.has_collection(COLLECTION_NAME):
+        if not client.has_collection(COLLECTION_NAME):
             logger.error(f"❌ Collection '{COLLECTION_NAME}' not found!")
             logger.error("Run: poetry run python -m project.schema_setup_hybrid")
             raise RuntimeError(f"Collection '{COLLECTION_NAME}' does not exist")
@@ -223,16 +218,16 @@ class MilvusHybridPipeline:
                 "chunk_overlap": chunk.get("chunk_overlap", 0),
                 "domain": chunk.get("domain", "general"),
                 "content_type": chunk.get("content_type", "text"),
-                "embedding_model": chunk.get("embedding_model", ""),
+                "embedding_model": chunk.get("embedding_model")or "TEI 768D",
                 "created_at": chunk.get("created_at", ""),
-                "dense_vector": chunk.get("dense_vector", []),
-                "sparse_vector": chunk.get("sparse_vector", {})
+                #"dense_vector": chunk.get("dense_vector", []),
+                #"sparse_vector": chunk.get("sparse_vector", {})
             }
             data.append(row)
         
         # Insert to Milvus
         try:
-            result = self.milvus_client.insert(
+            result = client.insert(
                 collection_name=COLLECTION_NAME,
                 data=data
             )
@@ -388,20 +383,20 @@ class MilvusHybridPipeline:
                         logger.info(f"Batch: chunks {batch_start}-{batch_end-1}")
                         
                         # Generate embeddings (dense + sparse)
-                        embedded_batch = self._embed_chunks_with_management(batch)
+                        # embedded_batch = self._embed_chunks_with_management(batch)
                         
                         # Insert to Milvus directly
                         if use_direct_insert:
-                            self._insert_to_milvus_direct(embedded_batch)
+                            self._insert_to_milvus_direct(batch)
                         
                         # Backup to JSON
                         self._append_to_json_file(
-                            embedded_batch,
+                            batch,
                             output_file,
                             total_chunks > 0
                         )
                         
-                        total_chunks += len(embedded_batch)
+                        total_chunks += len(batch)
                         
                         # Cleanup
                         self._cleanup_memory()

@@ -1,22 +1,19 @@
-# src/project/schema_setup_hybrid.py
+# src/project/schema_setup.py
 """
 Create Milvus collection with BOTH dense and sparse vectors for hybrid search.
-Dense: sentence-transformers embeddings (768D)
+Dense: TEI embeddings (768D)
 Sparse: BM25 vectors (built-in Milvus BM25)
 """
 
-from pymilvus import MilvusClient, DataType
+from pymilvus import MilvusClient, DataType, Function, FunctionType
+from .config import client, COLLECTION_NAME, TEI_ENDPOINT
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "rag_chunks_hybrid"
-
 def create_hybrid_collection():
     """Create collection with both dense and sparse vector fields"""
-    
-    client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
     
     # Drop existing collection if it exists
     if client.has_collection(COLLECTION_NAME):
@@ -28,7 +25,7 @@ def create_hybrid_collection():
     # Define schema with BOTH vector types
     schema = MilvusClient.create_schema(
         auto_id=False,
-        enable_dynamic_field=True
+        enable_dynamic_field=False  # Disable to avoid JSON index issues
     )
     
     # === Metadata Fields ===
@@ -36,7 +33,7 @@ def create_hybrid_collection():
     schema.add_field("doc_id", DataType.VARCHAR, max_length=255)
     schema.add_field("doc_name", DataType.VARCHAR, max_length=255)
     schema.add_field("chunk_index", DataType.INT64)
-    schema.add_field("chunk_text", DataType.VARCHAR, max_length=65535)
+    schema.add_field("chunk_text", DataType.VARCHAR, max_length=65535, enable_analyzer=True)
     schema.add_field("chunk_size", DataType.INT64)
     schema.add_field("chunk_tokens", DataType.INT64)
     schema.add_field("chunk_method", DataType.VARCHAR, max_length=50)
@@ -46,39 +43,68 @@ def create_hybrid_collection():
     schema.add_field("embedding_model", DataType.VARCHAR, max_length=200)
     schema.add_field("created_at", DataType.VARCHAR, max_length=50)
     
-    # === Dense Vector Field (from sentence-transformers) ===
+    # === Dense Vector Field (from TEI) ===
     schema.add_field(
         field_name="dense_vector",
         datatype=DataType.FLOAT_VECTOR,
         dim=768  # all-mpnet-base-v2 dimension
     )
     
-    # === Sparse Vector Field (BM25 - Milvus will generate this) ===
+    # === Sparse Vector Field (BM25 - Milvus auto-generated) ===
     schema.add_field(
         field_name="sparse_vector",
-        datatype=DataType.SPARSE_FLOAT_VECTOR  # Special type for sparse vectors
+        datatype=DataType.SPARSE_FLOAT_VECTOR
     )
     
-    # === Create Indexes ===
-    index_params = client.prepare_index_params()
-    
-    # Index for dense vector (semantic search)
-    index_params.add_index(
-        field_name="dense_vector",
-        index_type="HNSW",
-        metric_type="COSINE",
+    # === TEI Function (Dense Embeddings) ===
+    tei_function = Function(
+        name="tei_func",
+        function_type=FunctionType.TEXTEMBEDDING,
+        input_field_names=["chunk_text"],
+        output_field_names=["dense_vector"],
         params={
-            "M": 16,
-            "efConstruction": 200
+            "provider": "TEI",
+            "endpoint": TEI_ENDPOINT,
         }
     )
     
-    # Index for sparse vector (BM25 search)
+    # === BM25 Function (Sparse Embeddings) ===
+    bm25_function = Function(
+        name="text_bm25_emb",
+        input_field_names=["chunk_text"],
+        output_field_names=["sparse_vector"],
+        function_type=FunctionType.BM25,
+    )
+    
+    schema.add_function(tei_function)
+    schema.add_function(bm25_function)
+    
+    # === Index Parameters ===
+    index_params = client.prepare_index_params()
+    
+    # Primary key index
+    index_params.add_index(
+        field_name="chunk_id",
+        index_type="AUTOINDEX"
+    )
+    
+    # Dense vector index
+    index_params.add_index(
+        field_name="dense_vector",
+        index_type="AUTOINDEX",
+        metric_type="COSINE"
+    )
+    
+    # Sparse vector index (BM25)
     index_params.add_index(
         field_name="sparse_vector",
-        index_type="SPARSE_INVERTED_INDEX",  # Optimized for sparse vectors
-        metric_type="IP",  # BM25 similarity metric
-        params={}
+        index_type="SPARSE_INVERTED_INDEX",
+        metric_type="BM25",
+        params={
+            "inverted_index_algo": "DAAT_MAXSCORE",
+            "bm25_k1": 1.2,
+            "bm25_b": 0.75
+        }
     )
     
     # Create the collection
@@ -90,15 +116,12 @@ def create_hybrid_collection():
     )
     
     logger.info("✅ Hybrid collection created successfully!")
-    logger.info(f"   - Dense vectors: 768D FLOAT_VECTOR with HNSW index")
-    logger.info(f"   - Sparse vectors: SPARSE_FLOAT_VECTOR with BM25 index")
     
     return client
 
 
 def verify_collection():
-    """Verify the collection was created correctly"""
-    client = MilvusClient(uri="http://4.213.199.69:19530",token="SecurePassword123")
+    """Verify collection was created correctly"""
     
     if not client.has_collection(COLLECTION_NAME):
         logger.error(f"❌ Collection '{COLLECTION_NAME}' not found!")
@@ -111,6 +134,12 @@ def verify_collection():
         field_name = field['name']
         field_type = field['type']
         logger.info(f"   - {field_name}: {field_type}")
+    
+    # Check functions
+    logger.info("\n🔧 Configured Functions:")
+    if 'functions' in schema_info:
+        for func in schema_info['functions']:
+            logger.info(f"   - {func.get('name', 'Unknown')}: {func.get('type', 'Unknown')}")
     
     logger.info("\n✅ Collection verified successfully!")
     return True

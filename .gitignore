@@ -56,6 +56,7 @@ coverage.xml
 
 Virtual Environments
 .env
+.pem
 .venv
 venv/
 ENV/
@@ -112,7 +113,7 @@ Ignore database files and other large output files
 *.h5
 *.hdf5
 *.ckpt
-
+*.pem
 
 # Custom ignores can be added below
 

@@ -1,136 +1,69 @@
 """
-FINAL OPTIMIZED: RRF + Cross-Encoder + Memory Management
+FINAL OPTIMIZED: Native Hybrid Search + Cross-Encoder + Memory Management
 
-Combines best of both worlds:
-- ✅ RRF fusion (no weight tuning needed)
-- ✅ Cross-encoder reranking (accuracy)
-- ✅ Aggressive memory management (for 41k+ queries)
-- ✅ Connection refresh (prevents degradation)
-- ✅ Parallel processing (speed)
-- ✅ CSV output with all scores
+Uses Milvus native hybrid_search with:
+- ✅ BM25 sparse search (native)
+- ✅ Dense vector search
+- ✅ RRF ranker (built-in)
+- ✅ Cross-encoder reranking
+- ✅ Memory management
+- ✅ Parallel processing
 """
 
 import json
 import zipfile
 import logging
 import csv
-import hashlib
 import gc
 import psutil
 from pathlib import Path
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from pymilvus import MilvusClient, Collection, connections
+from pymilvus import AnnSearchRequest, RRFRanker, Collection, connections
+from .config import client, COLLECTION_NAME, AZURE_MILVUS_URI, AZURE_MILVUS_TOKEN
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import numpy as np
 import torch
 
-# Stopwords for BM25
-STOPWORDS: Set[str] = {
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
-    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that',
-    'the', 'to', 'was', 'were', 'will', 'with', 'this', 'but', 'they',
-    'have', 'had', 'what', 'when', 'where', 'who', 'which', 'can',
-    'their', 'if', 'out', 'so', 'up', 'been', 'than', 'them', 'she',
-}
-
 # Configuration
 QUERIES_FILE = 'random_1000_queries.json'
-OUTPUT_DIR = 'submission_hybrid_rf'
-ZIP_FILENAME = 'PS04_RRF.zip'
-CSV_OUTPUT = 'Final_rrf(10_search)_results_with_scores.csv'
+OUTPUT_DIR = 'submission_hybrid_native'
+ZIP_FILENAME = 'PS04_Native_Hybrid.zip'
+CSV_OUTPUT = 'Final_5chunkrerank.csv'
 
-MILVUS_URI = "http://4.213.199.69:19530"
-TOKEN = "SecurePassword123"
-COLLECTION_NAME = "rag_chunks_hybrid"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 # Search parameters
-SEARCH_LIMIT = 10
+SEARCH_LIMIT = 15
 FINAL_TOP_K = 5
-RRF_K = 10  # Standard RRF parameter
+CANDIDATE_MULTIPLIER = 2  # Retrieve SEARCH_LIMIT * 2 candidates before final ranking
 
 # Cross-encoder
 USE_CROSS_ENCODER = True
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# Performance (optimized for 8-core 32GB VM)
+# Performance
 EMBEDDING_BATCH_SIZE = 36
 PROCESS_BATCH_SIZE = 72
 MAX_WORKERS = 12
 CROSS_ENCODER_BATCH = 36
-
-# Sparse vector config
-VOCAB_SIZE = 10_000_000
-MIN_TOKEN_LENGTH = 2
 
 # Memory management
 MEMORY_CHECK_INTERVAL = 25
 MAX_MEMORY_PERCENT = 75
 CONNECTION_REFRESH_INTERVAL = 1000
 
+# Field names in Milvus collection
+SPARSE_VECTOR_FIELD = "sparse_vector"
+DENSE_VECTOR_FIELD = "dense_vector"
+OUTPUT_FIELDS = ["chunk_id", "doc_id", "doc_name", "chunk_text"]
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-STOPWORDS: Set[str] = {
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
-    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that',
-    'the', 'to', 'was', 'were', 'will', 'with', 'this', 'but', 'they',
-    'have', 'had', 'what', 'when', 'where', 'who', 'which', 'can',
-    'their', 'if', 'out', 'so', 'up', 'been', 'than', 'them', 'she',
-}
-
-
-def deterministic_token_hash(token: str, vocab_size: int) -> int:
-    """SHA256-based deterministic hashing"""
-    hash_bytes = hashlib.sha256(token.encode('utf-8')).digest()
-    hash_int = int.from_bytes(hash_bytes[:8], byteorder='big')
-    return hash_int % vocab_size
-
-
-def tokenize_text(text: str) -> List[str]:
-    """
-    Tokenize text for BM25 (matches pipeline approach)
-    Simple whitespace + lowercase, minimal filtering
-    """
-    tokens = text.lower().split()
-    # Only filter very short tokens and stopwords
-    return [t for t in tokens if len(t) >= MIN_TOKEN_LENGTH and t not in STOPWORDS]
-
-
-def generate_sparse_vector_bm25(text: str) -> Dict[int, float]:
-    """
-    Generate BM25-style sparse vector (matches your pipeline exactly)
-    
-    This matches complete_pipeline_hybrid.py:
-    - Tokenize with lowercase + whitespace split
-    - Count term frequencies
-    - Normalize by max frequency
-    - Use hash(token) as index
-    """
-    tokens = tokenize_text(text)
-    
-    if not tokens:
-        return {}
-    
-    # Count term frequencies
-    term_freq = {}
-    for token in tokens:
-        token_id = deterministic_token_hash(token,VOCAB_SIZE)
-        term_freq[token_id] = term_freq.get(token_id, 0) + 1
-    
-    # Normalize by max frequency (BM25-like)
-    max_freq = max(term_freq.values())
-    sparse_vector = {
-        idx: freq / max_freq 
-        for idx, freq in term_freq.items()
-    }
-    
-    return sparse_vector
 
 
 def check_memory() -> Dict[str, float]:
@@ -160,66 +93,12 @@ def aggressive_cleanup():
         pass
 
 
-def reciprocal_rank_fusion(
-    sparse_results: List[Dict],
-    dense_results: List[Dict],
-    k: int = 60
-) -> List[Dict]:
-    """
-    RRF: Combines rankings without needing score normalization
-    Formula: RRF_score = sum(1 / (k + rank_i))
-    """
-    rrf_scores = {}
-    
-    # Process sparse results
-    for rank, result in enumerate(sparse_results, 1):
-        chunk_id = result['chunk_id']
-        if chunk_id not in rrf_scores:
-            rrf_scores[chunk_id] = {
-                'chunk_id': chunk_id,
-                'doc_id': result.get('doc_id', ''),
-                'doc_name': result.get('doc_name', ''),
-                'chunk_text': result.get('chunk_text', ''),
-                'rrf_score': 0.0,
-                'sparse_rank': rank,
-                'dense_rank': None,
-                'sparse_score': result.get('distance', 0.0),
-                'dense_score': None
-            }
-        rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
-    
-    # Process dense results
-    for rank, result in enumerate(dense_results, 1):
-        chunk_id = result['chunk_id']
-        if chunk_id not in rrf_scores:
-            rrf_scores[chunk_id] = {
-                'chunk_id': chunk_id,
-                'doc_id': result.get('doc_id', ''),
-                'doc_name': result.get('doc_name', ''),
-                'chunk_text': result.get('chunk_text', ''),
-                'rrf_score': 0.0,
-                'sparse_rank': None,
-                'dense_rank': rank,
-                'sparse_score': None,
-                'dense_score': result.get('distance', 0.0)
-            }
-        else:
-            rrf_scores[chunk_id]['dense_rank'] = rank
-            rrf_scores[chunk_id]['dense_score'] = result.get('distance', 0.0)
-        
-        rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
-    
-    # Sort by RRF score
-    ranked = sorted(rrf_scores.values(), key=lambda x: x['rrf_score'], reverse=True)
-    return ranked
-
-
-class OptimizedRRFProcessor:
-    """Final optimized RRF + Cross-Encoder processor with memory management"""
+class NativeHybridProcessor:
+    """Native Milvus hybrid_search with Cross-Encoder reranking"""
     
     def __init__(self):
         logger.info("="*70)
-        logger.info("FINAL OPTIMIZED: RRF + BM25 (Pipeline-Compatible) + Cross-Encoder")
+        logger.info("NATIVE HYBRID SEARCH: BM25 + Dense + RRF + Cross-Encoder")
         logger.info("="*70)
         
         # Memory tracking
@@ -240,7 +119,6 @@ class OptimizedRRFProcessor:
             self.cross_encoder = None
         
         # Connect to Milvus
-        self.client = None
         self.collection = None
         self._connect_to_milvus()
         
@@ -252,25 +130,22 @@ class OptimizedRRFProcessor:
         
         logger.info(f"⚡ Workers: {MAX_WORKERS}, Batch: {PROCESS_BATCH_SIZE}")
         logger.info("="*70)
-        logger.info("✓ Ready - Using pipeline-compatible BM25!\n")
+        logger.info("✓ Ready - Using native Milvus hybrid_search!\n")
     
     def _connect_to_milvus(self, max_retries=3):
         """Connect to Milvus with cleanup"""
         try:
             if hasattr(self, 'collection') and self.collection:
                 self.collection.release()
-            if hasattr(self, 'client') and self.client:
-                self.client.close()
             connections.disconnect("default")
         except:
             pass
         
-        logger.info(f"Connecting to Milvus at {MILVUS_URI}")
+        logger.info(f"Connecting to Milvus at {AZURE_MILVUS_URI}")
         
         for attempt in range(1, max_retries + 1):
             try:
-                self.client = MilvusClient(uri=MILVUS_URI, token=TOKEN, timeout=20)
-                connections.connect("default", uri=MILVUS_URI, token=TOKEN, timeout=20)
+                connections.connect("default", uri=AZURE_MILVUS_URI, token=AZURE_MILVUS_TOKEN, timeout=20)
                 break
             except Exception as e:
                 if attempt < max_retries:
@@ -278,7 +153,7 @@ class OptimizedRRFProcessor:
                 else:
                     raise RuntimeError(f"Connection failed") from e
         
-        if not self.client.has_collection(COLLECTION_NAME):
+        if not client.has_collection(COLLECTION_NAME):
             raise RuntimeError(f"Collection '{COLLECTION_NAME}' not found!")
         
         self.collection = Collection(COLLECTION_NAME)
@@ -299,7 +174,7 @@ class OptimizedRRFProcessor:
                 logger.error(f"Connection refresh failed: {e}")
     
     def embed_queries_batch(self, queries: List[Tuple[str, str]]) -> List[Tuple]:
-        """Batch embed with BM25 sparse vectors (pipeline-compatible)"""
+        """Batch embed queries (dense only, BM25 uses raw text)"""
         query_nums = [q[0] for q in queries]
         query_texts = [q[1] for q in queries]
         
@@ -313,86 +188,142 @@ class OptimizedRRFProcessor:
                 normalize_embeddings=True
             )
         
-        # BM25 sparse embeddings (matches pipeline)
-        sparse_embeddings = [generate_sparse_vector_bm25(text) for text in query_texts]
-        
-        result = list(zip(query_nums, query_texts, dense_embeddings, sparse_embeddings))
+        result = list(zip(query_nums, query_texts, dense_embeddings))
         
         # Clear references
         del dense_embeddings
-        del sparse_embeddings
         
         return result
     
-    def search_single_vector(
+    def hybrid_search_native(
         self,
-        vector_type: str,
-        vector_data,
-        limit: int
+        query_text: str,
+        dense_vector: np.ndarray
     ) -> List[Dict]:
-        """Search with single vector type"""
+        """Native Milvus hybrid_search with BM25 + Dense + RRF"""
         try:
-            if vector_type == "dense":
-                search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
-                results = self.client.search(
-                    collection_name=COLLECTION_NAME,
-                    data=[vector_data.tolist() if isinstance(vector_data, np.ndarray) else vector_data],
-                    limit=limit,
-                    search_params=search_params,
-                    anns_field="dense_vector",
-                    output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
-                )
-            else:  # sparse
-                search_params = {"metric_type": "IP", "params": {}}
-                results = self.client.search(
-                    collection_name=COLLECTION_NAME,
-                    data=[vector_data],
-                    limit=limit,
-                    search_params=search_params,
-                    anns_field="sparse_vector",
-                    output_fields=["chunk_id", "doc_id", "doc_name", "chunk_text"]
-                )
+            # Prepare sparse search request (BM25 with raw text)
+            sparse_search_params = {
+                "metric_type": "BM25",
+                "params": {
+                    "inverted_index_algo": "DAAT_MAXSCORE",
+                    "bm25_k1": 1.2,
+                    "bm25_b": 0.75
+                }
+            }
+            sparse_request = AnnSearchRequest(
+                data=[query_text],
+                anns_field=SPARSE_VECTOR_FIELD,
+                param=sparse_search_params,
+                limit=SEARCH_LIMIT * CANDIDATE_MULTIPLIER
+            )
             
+            # Prepare dense search request
+            dense_search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64}
+            }
+            dense_request = AnnSearchRequest(
+                data=[dense_vector.tolist()],
+                anns_field=DENSE_VECTOR_FIELD,
+                param=dense_search_params,
+                limit=SEARCH_LIMIT * CANDIDATE_MULTIPLIER
+            )
+            
+            # Perform native hybrid search with RRF
+            results = client.hybrid_search(
+                collection_name=COLLECTION_NAME,
+                reqs=[sparse_request, dense_request],
+                ranker=RRFRanker(),
+                limit=SEARCH_LIMIT,
+                output_fields=OUTPUT_FIELDS
+            )
+            
+            # Format results
             formatted = []
-            for hit in results[0]:
-                formatted.append({
-                    'chunk_id': hit['entity'].get('chunk_id', ''),
-                    'doc_id': hit['entity'].get('doc_id', ''),
-                    'doc_name': hit['entity'].get('doc_name', ''),
-                    'chunk_text': hit['entity'].get('chunk_text', ''),
-                    'distance': float(hit['distance'])
-                })
+            if results and results[0]:
+                for rank, hit in enumerate(results[0], 1):
+                    formatted.append({
+                        'rank': rank,
+                        'chunk_id': hit.entity.get('chunk_id', ''),
+                        'doc_id': hit.entity.get('doc_id', ''),
+                        'doc_name': hit.entity.get('doc_name', ''),
+                        'chunk_text': hit.entity.get('chunk_text', ''),
+                        'hybrid_score': float(hit.score),
+                        'distance': float(hit.distance) if hasattr(hit, 'distance') else float(hit.score)
+                    })
             
-            # Clear references
             del results
             return formatted
             
         except Exception as e:
-            logger.error(f"{vector_type} search failed: {e}")
+            logger.error(f"Hybrid search failed: {e}")
             return []
     
-    def hybrid_search_rrf(
-        self,
-        dense_vector: np.ndarray,
-        sparse_vector: Dict[int, float]
-    ) -> List[Dict]:
-        """Hybrid search using RRF"""
-        sparse_results = self.search_single_vector("sparse", sparse_vector, SEARCH_LIMIT)
-        dense_results = self.search_single_vector("dense", dense_vector, SEARCH_LIMIT)
+    def process_single_query(self, query_data: Tuple) -> Dict:
+        """Process single query with native hybrid search"""
+        query_num, query_text, dense_vec = query_data
         
-        rrf_results = reciprocal_rank_fusion(sparse_results, dense_results, k=RRF_K)
+        try:
+            # Native hybrid search
+            hybrid_results = self.hybrid_search_native(query_text, dense_vec)
+            
+            if not hybrid_results:
+                return {
+                    "query_num": query_num,
+                    "query_text": query_text,
+                    "candidates": [],
+                    "doc_ids": [],
+                    "success": True
+                }
+            
+            return {
+                "query_num": query_num,
+                "query_text": query_text,
+                "candidates": hybrid_results,
+                "success": True
+            }
+            
+        except Exception as e:
+            logger.error(f"✗ Query {query_num} failed: {e}")
+            return {
+                "query_num": query_num,
+                "query_text": query_text,
+                "candidates": [],
+                "doc_ids": [],
+                "success": False,
+                "error": str(e)
+            }
+    
+    def search_parallel_batch(self, embedded_queries: List) -> List[Dict]:
+        """Search in parallel"""
+        start = time.time()
         
-        # Clear references
-        del sparse_results
-        del dense_results
+        results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self.process_single_query, qdata): qdata[0]
+                for qdata in embedded_queries
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=30)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Query failed: {e}")
         
-        return rrf_results
+        duration = time.time() - start
+        speed = len(embedded_queries) / duration if duration > 0 else 0
+        logger.info(f"  Search: {len(embedded_queries)} queries in {duration:.2f}s ({speed:.1f} q/s)")
+        
+        return results
     
     def cross_encoder_rerank_batch(
         self,
         queries_and_candidates: List[Tuple[str, List[Dict]]]
     ) -> List[List[Dict]]:
-        """Batch cross-encoder reranking with memory management"""
+        """Batch cross-encoder reranking"""
         if not self.cross_encoder or not queries_and_candidates:
             return [candidates for _, candidates in queries_and_candidates]
         
@@ -433,72 +364,13 @@ class OptimizedRRFProcessor:
         
         return reranked_results
     
-    def process_single_query(self, query_data: Tuple) -> Dict:
-        """Process single query"""
-        query_num, query_text, dense_vec, sparse_vec = query_data
-        
-        try:
-            # RRF hybrid search
-            rrf_results = self.hybrid_search_rrf(dense_vec, sparse_vec)
-            
-            if not rrf_results:
-                return {
-                    "query_num": query_num,
-                    "query_text": query_text,
-                    "candidates": [],
-                    "doc_ids": [],
-                    "success": True
-                }
-            
-            return {
-                "query_num": query_num,
-                "query_text": query_text,
-                "candidates": rrf_results[:SEARCH_LIMIT],
-                "success": True
-            }
-            
-        except Exception as e:
-            logger.error(f"✗ Query {query_num} failed: {e}")
-            return {
-                "query_num": query_num,
-                "query_text": query_text,
-                "candidates": [],
-                "doc_ids": [],
-                "success": False,
-                "error": str(e)
-            }
-    
-    def search_parallel_batch(self, embedded_queries: List) -> List[Dict]:
-        """Search in parallel"""
-        start = time.time()
-        
-        results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(self.process_single_query, qdata): qdata[0]
-                for qdata in embedded_queries
-            }
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result(timeout=30)
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Query failed: {e}")
-        
-        duration = time.time() - start
-        speed = len(embedded_queries) / duration if duration > 0 else 0
-        logger.info(f"  Search: {len(embedded_queries)} queries in {duration:.2f}s ({speed:.1f} q/s)")
-        
-        return results
-    
     def finalize_results(self, results: List[Dict]) -> List[Dict]:
-        """Batch cross-encoder reranking and finalize"""
+        """Apply cross-encoder reranking and finalize"""
         successful = [r for r in results if r['success'] and r.get('candidates')]
         
         if USE_CROSS_ENCODER and successful:
             queries_and_candidates = [
-                (r['query_text'], r['candidates'])
+                (r['query_text'], r['candidates'][:FINAL_TOP_K])
                 for r in successful
             ]
             
@@ -531,9 +403,8 @@ class OptimizedRRFProcessor:
                         'chunk_id': candidate.get('chunk_id', ''),
                         'doc_id': candidate.get('doc_id', ''),
                         'doc_name': candidate.get('doc_name', ''),
-                        'rrf_score': candidate.get('rrf_score', 0.0),
-                        'sparse_rank': candidate.get('sparse_rank') or 0,
-                        'dense_rank': candidate.get('dense_rank') or 0,
+                        'hybrid_score': candidate.get('hybrid_score', 0.0),
+                        'initial_rank': candidate.get('rank', 0),
                         'cross_encoder_score': candidate.get('cross_encoder_score', 0.0),
                         'chunk_text': candidate.get('chunk_text', '')[:500]
                     })
@@ -557,7 +428,7 @@ class OptimizedRRFProcessor:
                 
                 result['doc_ids'] = doc_ids
                 
-                # CSV data (no cross-encoder scores)
+                # CSV data
                 for rank, candidate in enumerate(candidates, 1):
                     self.csv_data.append({
                         'query_num': result['query_num'],
@@ -566,9 +437,8 @@ class OptimizedRRFProcessor:
                         'chunk_id': candidate.get('chunk_id', ''),
                         'doc_id': candidate.get('doc_id', ''),
                         'doc_name': candidate.get('doc_name', ''),
-                        'rrf_score': candidate.get('rrf_score', 0.0),
-                        'sparse_rank': candidate.get('sparse_rank') or 0,
-                        'dense_rank': candidate.get('dense_rank') or 0,
+                        'hybrid_score': candidate.get('hybrid_score', 0.0),
+                        'initial_rank': candidate.get('rank', 0),
                         'cross_encoder_score': 0.0,
                         'chunk_text': candidate.get('chunk_text', '')[:500]
                     })
@@ -605,7 +475,7 @@ class OptimizedRRFProcessor:
             with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = [
                     'query_num', 'query_text', 'rank', 'chunk_id', 'doc_id', 'doc_name',
-                    'rrf_score', 'sparse_rank', 'dense_rank', 'cross_encoder_score', 'chunk_text'
+                    'hybrid_score', 'initial_rank', 'cross_encoder_score', 'chunk_text'
                 ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
@@ -632,7 +502,7 @@ class OptimizedRRFProcessor:
         self.total_queries = len(queries)
         
         logger.info(f"Processing {self.total_queries} queries")
-        logger.info(f"Method: RRF (k={RRF_K}) + Cross-Encoder")
+        logger.info(f"Method: Native Hybrid Search (BM25 + Dense) with RRF + Cross-Encoder")
         logger.info("="*70)
         
         output_path = Path(OUTPUT_DIR)
@@ -728,7 +598,7 @@ class OptimizedRRFProcessor:
         mem_growth = final_mem['used_gb'] - self.initial_memory['used_gb']
         
         logger.info(f"\n{'='*70}")
-        logger.info("✅ COMPLETE - Pipeline-Compatible BM25!")
+        logger.info("✅ COMPLETE - Native Hybrid Search!")
         logger.info(f"{'='*70}")
         logger.info(f"Queries: {len(queries)} | Success: {success_count}")
         logger.info(f"Time: {total_time/60:.2f} min | Speed: {len(queries)/total_time:.2f} q/s")
@@ -736,7 +606,7 @@ class OptimizedRRFProcessor:
         logger.info(f"Connection refreshes: {self.connection_refreshes}")
         logger.info(f"Output: {ZIP_FILENAME}")
         logger.info(f"CSV: {CSV_OUTPUT} ({len(self.csv_data)} rows)")
-        logger.info(f"Method: BM25 (hash-based, max-freq normalized) + RRF + Cross-Encoder")
+        logger.info(f"Method: Native Milvus hybrid_search (BM25 + Dense + RRF) + Cross-Encoder")
         logger.info(f"{'='*70}")
     
     def cleanup(self):
@@ -744,8 +614,6 @@ class OptimizedRRFProcessor:
         try:
             if self.collection:
                 self.collection.release()
-            if self.client:
-                self.client.close()
             connections.disconnect("default")
         except:
             pass
@@ -754,7 +622,7 @@ class OptimizedRRFProcessor:
 def main():
     processor = None
     try:
-        processor = OptimizedRRFProcessor()
+        processor = NativeHybridProcessor()
         processor.process_all_queries()
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)

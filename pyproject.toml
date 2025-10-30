@@ -38,7 +38,8 @@ dependencies = [
     "psutil (>=7.1.0,<8.0.0)",
     "aiosqlite (>=0.21.0,<0.22.0)",
     "rank-bm25 (>=0.2.2,<0.3.0)",
-    "pymilvus (>=2.6.2,<3.0.0)"
+    "pymilvus (>=2.6.2,<3.0.0)",
+    "gdown (>=5.2.0,<6.0.0)"
 ]
 
 [tool.poetry]
