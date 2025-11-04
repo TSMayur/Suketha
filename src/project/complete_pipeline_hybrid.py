@@ -652,7 +652,7 @@ class StreamingPipeline:
         output_file = output_path / "processed_chunks.json"
         
         # Discover files
-        db_path = input_path / "zee_metadata.db"
+        db_path = input_path / "shortlist.db"
         if db_path.exists():
             logger.info(f"\n📂 Loading from SQLite: {db_path}")
             files = self._get_files_from_sqlite(str(db_path))
@@ -753,7 +753,12 @@ class StreamingPipeline:
     
     def _get_files_from_sqlite(self, db_path: str):
         """Load files from SQLite"""
-        query = "SELECT doc_id, source_path FROM documents WHERE processing_status='pending'"
+        query = """
+        SELECT doc_id, source_path
+        FROM documents
+        WHERE processing_status='pending'
+        ORDER BY CAST(REPLACE(REPLACE(doc_name, 'doc_', ''), '.txt', '') AS INTEGER)
+        """
         with sqlite3.connect(db_path) as conn:
             files = []
             for doc_id, source_path in conn.execute(query):
@@ -797,10 +802,10 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--chunk-overlap", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=150, help="Batch size for Milvus inserts (REDUCED to 50)")
+    parser.add_argument("--batch-size", type=int, default=20, help="Batch size for Milvus inserts (REDUCED to 50)")
     parser.add_argument("--queue-size", type=int, default=1500, help="Max chunks in queue")
     parser.add_argument("--stream-mb", type=int, default=10, help="Stream read chunk size in MB")
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel consumer threads (start with 2-4)")
+    parser.add_argument("--workers", type=int, default=5, help="Number of parallel consumer threads (start with 2-4)")
 
     args = parser.parse_args()
 

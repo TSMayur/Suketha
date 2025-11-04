@@ -248,7 +248,7 @@ class ChunkCleaner:
             
             cleaned_chunks.append(chunk)
         
-        logger.info(f"Cleaned {len(chunk_dicts)} chunks -> {len(cleaned_chunks)} kept, {filtered_count} filtered")
+        logger.debug(f"Cleaned {len(chunk_dicts)} chunks -> {len(cleaned_chunks)} kept, {filtered_count} filtered")
         
         return cleaned_chunks
     

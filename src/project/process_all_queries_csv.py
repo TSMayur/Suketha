@@ -27,15 +27,15 @@ import numpy as np
 import torch
 
 # Configuration
-QUERIES_FILE = 'random_1000_queries.json'
+QUERIES_FILE = 'new_queries.json'
 OUTPUT_DIR = 'submission_hybrid_native'
-ZIP_FILENAME = 'PS04_Native_Hybrid.zip'
-CSV_OUTPUT = 'Final_5chunkrerank.csv'
+ZIP_FILENAME = 'PS04_Shortlisting.zip'
+CSV_OUTPUT = 'Final_shortlisting.csv'
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 # Search parameters
-SEARCH_LIMIT = 15
+SEARCH_LIMIT = 50
 FINAL_TOP_K = 5
 CANDIDATE_MULTIPLIER = 2  # Retrieve SEARCH_LIMIT * 2 candidates before final ranking
 
@@ -221,7 +221,7 @@ class NativeHybridProcessor:
             # Prepare dense search request
             dense_search_params = {
                 "metric_type": "COSINE",
-                "params": {"ef": 64}
+                "params": {"ef": 200}
             }
             dense_request = AnnSearchRequest(
                 data=[dense_vector.tolist()],
@@ -370,7 +370,7 @@ class NativeHybridProcessor:
         
         if USE_CROSS_ENCODER and successful:
             queries_and_candidates = [
-                (r['query_text'], r['candidates'][:FINAL_TOP_K])
+                (r['query_text'], r['candidates'])
                 for r in successful
             ]
             
@@ -406,7 +406,7 @@ class NativeHybridProcessor:
                         'hybrid_score': candidate.get('hybrid_score', 0.0),
                         'initial_rank': candidate.get('rank', 0),
                         'cross_encoder_score': candidate.get('cross_encoder_score', 0.0),
-                        'chunk_text': candidate.get('chunk_text', '')[:500]
+                        'chunk_text': candidate.get('chunk_text', '')[:2000]
                     })
                 
                 result['candidates'] = None
