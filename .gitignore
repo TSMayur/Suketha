@@ -53,6 +53,7 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+.log
 
 Virtual Environments
 .env
@@ -114,7 +115,7 @@ Ignore database files and other large output files
 *.hdf5
 *.ckpt
 *.pem
-
+*.log
 # Custom ignores can be added below
 
 # End of .gitignore
