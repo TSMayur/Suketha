@@ -24,7 +24,7 @@
 
 Instead of using a `requirements.txt`, Poetry's `pyproject.toml` file was used. This provides better version pinning and environment reproducibility.
 
-```bash
+```
 # Install Poetry
 pip install poetry
 
