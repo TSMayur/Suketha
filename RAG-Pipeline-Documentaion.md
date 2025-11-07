@@ -17,8 +17,10 @@
 7. [Phase 6: Vector Database - Milvus Hybrid Search](#phase-6-vector-database---milvus-hybrid-search)
 8. [Phase 7: Complete Processing Pipeline](#phase-7-complete-processing-pipeline)
 9. [Phase 8: Query and Hybrid Search System](#phase-8-query-and-hybrid-search-system)
-10. [Key Architectural Decisions](#key-architectural-decisions)
-11. [File Reference Guide](#file-reference-guide)
+10. [Phase 8.5: Domain Classification and Document Separation](#phase-85-domain-classification-and-document-separation)
+11. [Phase 9: Evaluation Framework - Ground Truth and Metrics](#phase-9-evaluation-framework---ground-truth-and-metrics)
+12. [Key Architectural Decisions](#key-architectural-decisions)
+13. [File Reference Guide](#file-reference-guide)
 
 ---
 
@@ -84,7 +86,11 @@ rag-project/
 │       ├── complete_pipeline_hybrid.py # Hybrid search pipeline
 │       ├── query_engine.py             # Search interface
 │       └── test_hybrid_search.py       # Hybrid search testing
-├
+├── data/
+│   ├── input/                          # Input documents
+│   ├── output/                         # Processed data
+│   └── db/                             # Database files
+├── logs/                               # Application logs
 ├── pyproject.toml                      # Poetry configuration
 ├── poetry.lock                         # Locked dependencies
 └── .env                                # Environment variables
@@ -2379,6 +2385,254 @@ for i, hit in enumerate(results):
 
 ---
 
+
+
+## Phase 8.5: Domain Classification and Document Separation
+
+### The Problem
+
+Different datasets require different chunking strategies and retrieval techniques. A COVID-19 research paper needs different handling than a cybersecurity threat intelligence report. The pipeline needs to automatically classify documents into domains for domain-aware processing.
+
+### Domain Categories
+
+The system supports the following domains:
+
+- **CORD19**: COVID-19 research papers (medical, epidemiological)
+- **APTNotes**: Cybersecurity threat intelligence and APT reports
+- **WikiHop**: Multi-hop reasoning datasets from Wikipedia
+- **EULaw**: European legal documents and regulations
+- **HotpotQA**: Question-answering datasets with supporting facts
+- **RobustQA**: Adversarial and robust QA benchmarks
+- **GENERAL**: Generic/unclassified documents
+
+### File: classify_domains_parallel.py
+
+**Purpose**: Automatically classify documents into domains using keyword matching and parallel processing.
+
+**Approach**:
+- Each domain has a predefined set of keywords (e.g., "covid", "vaccine", "pandemic" for CORD19)
+- Scans document text for keyword matches
+- Uses ProcessPoolExecutor for parallel classification across multiple CPU cores
+- Updates SQLite documents table with classified domain
+- Provides live progress reporting and final statistics
+
+**Key Features**:
+- **Parallel processing**: Scales to thousands of documents efficiently
+- **Keyword-based classification**: Fast, no ML model needed
+- **Fallback mechanism**: Unknown documents classified as "GENERAL"
+- **Real-time updates**: Domain written to SQLite as each document completes
+- **Statistics reporting**: Shows domain distribution at completion
+
+**Execution**:
+```bash
+python -m project.classify_domains_parallel
+```
+
+**Output**:
+- SQLite `documents` table updated with domain for each document
+- Console output showing progress: `[1/1000] document_id → CORD19`
+- Summary statistics: Total processed, errors, domain distribution with percentages
+
+**Performance**:
+- ~167 documents/second on 4 CPU cores
+- Scales linearly with available CPU cores
+
+### Integration Point
+
+Domain classification happens **after** document registration in SQLite but **before** chunking. The domain field is used later in the processing pipeline to:
+- Select appropriate chunking strategy (e.g., scientific paper structure for CORD19)
+- Choose domain-specific retrieval weights
+- Filter or group results by domain type
+
+---
+
+## Phase 9: Evaluation Framework - Ground Truth and Metrics
+
+### The Evaluation Problem
+
+How do we measure if the RAG system actually retrieves relevant chunks? We need:
+1. **Ground truth relevance labels** (which chunks are relevant to each query)
+2. **Retrieval metrics** (Precision, Recall, nDCG)
+3. **Per-query and per-domain analysis**
+
+The evaluation system provides automated ground truth generation and comprehensive metrics computation.
+
+### File: rel_csv.py - Generating Relevance Labels
+
+**Purpose**: Automatically generate relevance scores using multiple signals to measure how well chunks support queries.
+
+**What it does**:
+- Takes queries and top-15 retrieved chunks
+- Generates responses using Azure OpenAI based on the chunks
+- Computes three relevance signals:
+  1. **Query-Chunk Similarity**: How semantically similar is the query to the chunk? (0-1 scale)
+  2. **Response-Chunk Entailment**: Does the response logically follow from the chunk? Uses NLI model (0-1 scale)
+  3. **Hybrid Relevance**: Weighted combination (60% similarity + 40% entailment)
+
+**Relevance Scale** (after binning):
+- **0 = Not Relevant**: Score 0.0 - 0.33 (chunk has no useful information)
+- **1 = Slightly Relevant**: Score 0.33 - 0.66 (some tangential information)
+- **2 = Moderately Relevant**: Score 0.66 - 0.85 (supports query moderately)
+- **3 = Highly Relevant**: Score 0.85 - 1.0 (directly answers the query)
+
+**Models Used**:
+- `sentence-transformers/all-mpnet-base-v2`: For query-chunk similarity
+- `facebook/bart-large-mnli`: NLI model for entailment scoring (0=contradiction, 1=neutral, 2=entailment)
+- `Azure OpenAI`: Generates responses from chunks
+
+**Execution**:
+```bash
+python -m project.rel_csv
+```
+
+**Requires .env configuration**:
+```
+AZURE_ENDPOINT=<your_endpoint>
+AZURE_DEPLOYMENT_NAME=<your_deployment>
+AZURE_API_KEY=<your_api_key>
+```
+
+**Output**:
+- `results/D_rag_result_{timestamp}.csv`: Raw scores per chunk (query_similarity, entailment, hybrid_relevance, discrete_relevance)
+- Logs with progress and timing information
+
+**Performance**:
+- ~10-15 queries processed per minute (bottleneck is LLM API call)
+- Fully automated, no manual annotation needed
+
+---
+
+### File: score_collective.py - Computing Evaluation Metrics
+
+**Purpose**: Calculate Precision@K, Recall@K, and nDCG@K from system rankings and ground truth relevance labels.
+
+**Input Files**:
+- System rankings CSV (query, top-5 documents returned by system)
+- Ground truth relevance CSV (query, document, relevance_score)
+
+**Metrics Computed**:
+
+| Metric | Formula | What it Measures |
+|--------|---------|-----------------|
+| **Precision@5** | (True Positives) / 5 | Of the top-5 results, what fraction were relevant? |
+| **Recall@5** | (True Positives) / (Total Relevant) | Of all relevant docs, what fraction appeared in top-5? |
+| **nDCG@5** | DCG / IDCG | How close is the ranking to perfect ordering? (0-1 scale) |
+
+**How Metrics Work**:
+
+- **True Positives**: Documents in top-5 that have relevance_score ≥ 2 (moderately relevant or better)
+- **nDCG**: Uses DCG (Discounted Cumulative Gain) formula that rewards finding relevant documents early in the ranking
+  - Position 1 gets discount of 1.0 (highest weight)
+  - Position 2 gets discount of 0.63 (slightly lower)
+  - Position 5 gets discount of 0.43 (lowest)
+  - nDCG normalizes DCG by ideal DCG (perfect ranking)
+
+**Execution**:
+```bash
+python -m project.score_collective
+```
+
+**Output**:
+- `results/precision_recall_ndcg_results.csv`: Metrics per query
+- Console output: Aggregate means for all queries
+  - Mean Precision@5
+  - Mean Recall@5
+  - Mean nDCG@5
+- Logs with processing details
+
+**Interpretation**:
+- High Precision: System returns mostly relevant results (low false positives)
+- High Recall: System finds most of the relevant documents (low false negatives)
+- High nDCG: System ranks relevant docs higher than non-relevant ones
+
+---
+
+### Complete Evaluation Workflow
+
+**Step 1**: Register queries and chunks in database
+```bash
+# SQLite already has documents and chunks from pipeline
+```
+
+**Step 2**: Run retrieval system to get top-K results per query
+```bash
+python -m project.test_hybrid_search  # or complete_pipeline_hybrid.py
+# Output: system_rankings.csv (query, rank_doc_name)
+```
+
+**Step 3**: Generate ground truth relevance labels
+```bash
+python -m project.rel_csv
+# Output: D_rag_result_{timestamp}.csv (query, doc_name, relevance_score)
+```
+
+**Step 4**: Classify documents by domain (optional, for domain-level analysis)
+```bash
+python -m project.classify_domains_parallel
+# Updates SQLite documents table with domain field
+```
+
+**Step 5**: Compute evaluation metrics
+```bash
+python -m project.score_collective
+# Output: precision_recall_ndcg_results.csv with per-query metrics
+```
+
+### Output Files Summary
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `system_rankings.csv` | CSV | Top-5 documents per query from RAG system |
+| `D_rag_result_{timestamp}.csv` | CSV | Ground truth relevance labels (query, doc, relevance_score) |
+| `precision_recall_ndcg_results.csv` | CSV | Final metrics (precision@5, recall@5, ndcg@5 per query) |
+| Evaluation logs | TXT | Timestamp-based logs for debugging |
+
+### Key Design Decisions
+
+1. **Hybrid Relevance Scoring**: Combines semantic similarity (query understanding) with entailment (response support) for more robust ground truth
+2. **Automated Annotation**: Uses LLM + NLI models instead of manual annotation (faster, more scalable)
+3. **Parallel Domain Classification**: Classifies documents in parallel to handle large datasets efficiently
+4. **Threshold-based Metrics**: Relevance threshold = 2 (moderately relevant or above) for clear relevance decision
+5. **Position-aware Ranking**: nDCG heavily rewards finding relevant documents early in the ranking
+
+### Integration with Pipeline
+
+The evaluation framework is **independent of the processing pipeline**. You can:
+- Run the pipeline once to ingest and embed documents
+- Run evaluation multiple times with different queries
+- Compare different retrieval strategies (dense vs hybrid search)
+- Analyze performance per domain using the domain classification results
+
+---
+
+## Updated Table of Contents
+
+Add these to your main documentation ToC:
+
+1. Phase 1: Initial Project Setup and Poetry Introduction
+2. Phase 1.5: Docker Infrastructure Setup
+3. Phase 2: Document Loading and File Type Detection
+4. Phase 3: Text Splitting and Chunking Strategy
+5. Phase 4: Embedding Generation with GPU Optimization
+6. Phase 5: Database Architecture - SQLite Setup
+7. Phase 6: Vector Database - Milvus Hybrid Search
+8. Phase 7: Complete Processing Pipeline
+9. Phase 8: Query and Hybrid Search System
+10. **Phase 8.5: Domain Classification and Document Separation** ← NEW
+11. **Phase 9: Evaluation Framework - Ground Truth and Metrics** ← NEW
+
+---
+
+## File Reference Guide Update
+
+### New Files (Evaluation & Domain Classification)
+
+| File | Purpose | Active? | Entry Point? |
+|------|---------|---------|--------------|
+| `classify_domains_parallel.py` | Domain classification using keyword matching | ✅ YES | **YES** - Run after document registration |
+| `rel_csv.py` | Generate ground truth relevance labels | ✅ YES | **YES** - Run after retrieval to get labels |
+| `score_collective.py` | Compute Precision, Recall, nDCG metrics | ✅ YES | **YES** - Run to evaluate results |
+
 ## Key Architectural Decisions
 
 ### 1. Modular Architecture
@@ -2578,37 +2832,6 @@ for i, hit in enumerate(results):
     print(f"\n{i+1}. {hit['doc_name']} - Score: {hit['score']:.4f}")
     print(f"   {hit['chunk_text'][:300]}...")
 ```
-
----
-
-## Performance Metrics
-
-### Embedding Speed
-
-| Device | Batch Size | Speed (chunks/sec) | Notes |
-|--------|-----------|-------------------|-------|
-| CPU (Intel i7) | 32 | 40 | Baseline |
-| GPU (RTX 3090) | 32 | 2500 | 62x faster |
-| MPS (M1 Pro) | 32 | 2000 | 50x faster |
-
-### Search Latency
-
-| Index Type | Collection Size | Query Latency (p95) | Recall@10 |
-|------------|----------------|---------------------|-----------|
-| FLAT (brute force) | 100K | 50ms | 100% |
-| HNSW | 100K | 2ms | 99% |
-| HNSW | 1M | 5ms | 99% |
-| HNSW | 10M | 8ms | 98% |
-
-### Storage Efficiency
-
-| Component | Size (1M chunks) | Compression |
-|-----------|-----------------|-------------|
-| Raw text | 5 GB | N/A |
-| Dense vectors (768-dim) | 3 GB | None |
-| Sparse vectors (BM25) | 500 MB | Sparse format |
-| SQLite metadata | 200 MB | None |
-| **Total** | **8.7 GB** | **1.74x overhead** |
 
 ---
 
