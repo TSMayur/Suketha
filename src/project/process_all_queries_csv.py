@@ -28,14 +28,14 @@ import torch
 
 # Configuration
 QUERIES_FILE = 'new_queries.json'
-OUTPUT_DIR = 'submission_hybrid_native'
-ZIP_FILENAME = 'PS04_Shortlisting.zip'
-CSV_OUTPUT = 'Final_shortlisting.csv'
+OUTPUT_DIR = 'submission'
+ZIP_FILENAME = 'PS04_Shortlisting100chunksrerank.zip'
+CSV_OUTPUT = 'Final_shortlistingchunks100rerank.csv'
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 # Search parameters
-SEARCH_LIMIT = 50
+SEARCH_LIMIT = 100
 FINAL_TOP_K = 5
 CANDIDATE_MULTIPLIER = 2  # Retrieve SEARCH_LIMIT * 2 candidates before final ranking
 
@@ -221,7 +221,7 @@ class NativeHybridProcessor:
             # Prepare dense search request
             dense_search_params = {
                 "metric_type": "COSINE",
-                "params": {"ef": 200}
+                "params": {"ef": 300}
             }
             dense_request = AnnSearchRequest(
                 data=[dense_vector.tolist()],
