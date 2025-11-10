@@ -1,121 +1,203 @@
-# Advanced RAG Pipeline with Milvus & Poetry
+# Advanced RAG Pipeline with Streaming Ingestion
 
-This project implements a comprehensive and optimized Retrieval-Augmented Generation (RAG) pipeline designed for efficient document processing, embedding, and querying. It leverages state-of-the-art tools like Milvus for vector storage and SentenceTransformers for embeddings, all managed within a clean Poetry environment.
+This project implements a high-performance, database-driven RAG pipeline. It's designed for ingesting large quantities of documents, processing them in a memory-efficient streaming fashion, and querying them with an optimized hybrid search.
 
-## Features
+The pipeline uses **SQLite** to manage file ingestion state and **Milvus** as the vector store for a robust, scalable solution.
 
-  * **Multi-Format Document Processing**: Ingests and processes a wide range of document formats including PDF, TXT, JSON, DOCX, CSV, and TSV.
-  * **Optimized Chunking**: Implements various chunking strategies (recursive, Spacy, NLTK) to effectively segment documents.
-  * **High-Performance Embedding**: Utilizes `sentence-transformers/all-mpnet-base-v2` for generating high-quality embeddings, with optimizations for both CPU and GPU workflows.
-  * **Milvus Integration**: Employs Milvus as a robust and scalable vector store for storing and querying document chunks.
-  * **Bulk Import**: Features a streamlined bulk import process using MinIO for efficient data loading into Milvus.
-  * **Parallel Query Processing**: Optimized for handling large batches of queries concurrently for high-throughput searching.
-  * **Dockerized Environment**: Comes with a `docker-compose.yml` for easy setup of the required services (Milvus, MinIO, etcd).
-  * **Dependency Management**: Uses **Poetry** for clear, deterministic dependency management.
+## Key Features
 
-## Getting Started
+* **🚀 Streaming Ingestion Pipeline:** (`complete_pipeline_hybrid.py`) Uses a parallel producer/consumer model to read, chunk, and ingest documents without loading entire files into memory.
+* **🔍 Optimized Hybrid Search:** (`process_all_queries_csv.py`) Implements a sophisticated query process using Milvus's native hybrid search (BM25 + Dense Vectors), RRF reranking, and a final Cross-Encoder pass for state-of-the-art accuracy.
+* **📋 Database-Driven Workflow:** The entire ingestion process is managed by an SQLite database.
+    * `sqlite_setup.py`: Initializes the database.
+    * `file_meta_loader.py`: Scans source directories and registers files as 'pending' in the DB.
+    * `complete_pipeline_hybrid.py`: Reads the 'pending' files from the DB, processes them, and inserts them into Milvus.
+* **🐳 Dockerized Infrastructure:** Includes a `docker-compose.yml` file to instantly launch a local Milvus, MinIO, and etcd stack.
+* **🧹 Advanced Text Processing:**
+    * `doc_reader.py`: Supports multiple file types (PDF, TXT, DOCX, CSV, etc.).
+    * `chunk_cleaner.py`: Scrubs noise, metadata, and malformed JSON from text chunks before embedding.
+* **📦 Modern Python Stack:** Managed with **Poetry** for reproducible dependencies.
 
-Follow these instructions to get a local copy of the project up and running.
+---
+
+## 🚀 Getting Started
 
 ### Prerequisites
 
-  * [Docker](https://www.docker.com/get-started) and Docker Compose
-  * [Poetry](https://www.google.com/search?q=https://python-poetry.org/docs/%23installation) (for managing Python dependencies)
-  * Python 3.10+
+* **Python 3.10+**
+* **[Poetry](https://python-poetry.org/docs/#installation)**
+* **[Docker](https://www.docker.com/get-started)** & Docker Compose
 
-### Installation
+### 1. Clone & Install Dependencies
 
-1.  **Clone the repository:**
+```sh
+# Clone the repository
+git clone [https://github.com/TSMayur/Suketha.git](https://github.com/TSMayur/Suketha.git)
+cd Suketha
 
-    ```sh
-    git clone https://github.com/TSMayur/Suketha.git
-    cd Suketha
-    ```
+# Install all dependencies using Poetry
+poetry install
+````
 
-2.  **Start the infrastructure services:**
-    This command launches Milvus, MinIO, and other dependencies in Docker containers.
+### 2\. Configure Your Environment
 
-    ```sh
-    docker-compose up -d
-    ```
+You must create a `.env` file in the root of the project. This file tells the scripts how to connect to Milvus and other services.
 
-3.  **Install Python dependencies using Poetry:**
-    This will create a virtual environment and install all the packages listed in `pyproject.toml`.
+**➡️ Create a file named `.env`** and add the following:
 
-    ```sh
-    poetry install
-    ```
+```ini
+# --- Milvus Connection ---
+# Use this for the local Docker setup
+AZURE_MILVUS_URI="http://localhost:19530"
+AZURE_MILVUS_TOKEN=""
 
-## Usage
+# (Optional) Or, use this for a cloud (Azure) instance
+# AZURE_MILVUS_URI="your-azure-milvus-uri.milvus.azure.com:19530"
+# AZURE_MILVUS_TOKEN="your-azure-milvus-token"
 
-All scripts should be run using `poetry run`. This ensures they execute within the correct virtual environment with all dependencies available.
+# --- Collection Name ---
+COLLECTION_NAME="rag_hybrid_chunks"
 
-### 1\. Set Up the Milvus Collection
+# --- TEI Endpoint ---
+# This is required by schema_setup.py for the embedding function.
+# You must provide a URL to a running Text Embeddings Inference container.
+TEI_ENDPOINT="http://your-tei-embedding-service-url"
+```
 
-First, create the Milvus collection with the correct schema.
+### 3\. Start Local Infrastructure
+
+This command starts Milvus, MinIO, and etcd using the `docker-compose.yml` file.
+
+```sh
+docker-compose up -d
+```
+
+You can view the Milvus UI (Attu) at [http://localhost:8000](https://www.google.com/search?q=http://localhost:8000).
+
+-----
+
+## ⚙️ Usage: The Main Workflow
+
+### Step 1: (One-Time) Create the Milvus Collection
+
+Before you can ingest data, you must create the collection in Milvus. This script configures the schema for hybrid search (BM25 sparse + dense vectors).
 
 ```sh
 poetry run python -m project.schema_setup
 ```
 
-### 2\. Process and Ingest Documents
+*(This only needs to be run once. It reads the `COLLECTION_NAME` and `TEI_ENDPOINT` from your `.env` file).*
 
-Place your source documents (PDFs, TXT files, etc.) into a directory (e.g., `data/`). Then, run the complete processing pipeline. This script will read the documents, chunk them, generate embeddings, and bulk import the data into Milvus.
+### Step 2: Ingest Your Documents
 
-Choose the appropriate pipeline for your hardware:
+This is a multi-step process that uses SQLite to track files.
 
-```sh
-# For CPU or hybrid environments
-poetry run python -m project.complete_pipeline_hybrid --input-dir data/ --output-dir prepared_data/
+1.  **Add your files** (PDFs, TXT, DOCX, etc.) into a source directory, for example: `data/test`.
 
-# For GPU (MPS) environments
-poetry run python -m project.complete_pipeline_gpu --input-dir data/ --output-dir prepared_data/
-```
+2.  **Clean up old database files** (optional, but recommended for a fresh start):
 
-### 3\. Run Queries
-
-Once your data is indexed, you can process a batch of queries from a JSON file.
-
-  * **For JSON output:**
     ```sh
-    poetry run python -m project.process_all_queries
+    rm -f data/hybrid/documents.db
+    rm -f prepared_for_upload/processed_chunks.json
     ```
-  * **For detailed CSV output:**
+
+3.  **Create a fresh SQLite database** to track your files:
+
+    ```sh
+    poetry run python src/project/sqlite_setup.py --db-path data/hybrid/documents.db
+    ```
+
+4.  **Scan your data folder** and register all files in the database:
+
+    ```sh
+    poetry run python src/project/file_meta_loader.py data/test --db data/hybrid/documents.db
+    ```
+
+5.  **Run the main streaming pipeline.** This script reads the "pending" files from the SQLite DB, processes them in parallel, and inserts them into Milvus:
+
+    ```sh
+    poetry run python -m project.complete_pipeline_hybrid \
+        --input-dir data/hybrid \
+        --output-dir prepared_for_upload
+    ```
+
+### Step 3: Run Queries
+
+Once your data is ingested, you can run queries.
+
+1.  **Edit the query file:** Add your questions to `new_queries.json`. It should look like this:
+
+    ```json
+    [
+      {
+        "query_num": "1",
+        "query": "What is the capital of France?"
+      },
+      {
+        "query_num": "2",
+        "query": "Describe the process of photosynthesis."
+      }
+    ]
+    ```
+
+2.  **Run the query script:**
+
     ```sh
     poetry run python -m project.process_all_queries_csv
     ```
 
-You can also query the documents interactively:
+This will:
 
-```sh
-poetry run python -m project.query_document
+1.  Embed all queries.
+2.  Perform a parallel hybrid search (BM25 + Dense) in Milvus.
+3.  Rerank the results using a Cross-Encoder.
+4.  Generate a `submission/` folder with individual JSON results.
+5.  Create a detailed `Final_shortlistingchunks100rerank.csv` file with all results, scores, and chunk text for analysis.
+
+-----
+
+## 📂 Project Structure
+
 ```
-
-## Project Structure
-
-```
-├── docker-compose.yml      # Docker configuration for infrastructure
-├── pyproject.toml          # Poetry dependencies and project metadata
+.
+|-- Data
+├── docker-compose.yml        # Infrastructure (Milvus, MinIO, etcd)
+├── pyproject.toml            # Poetry dependencies
+├── poetry.lock               # Exact dependency versions
+├── .env                      # <-- Your local configuration (you must create this)
+├── new_queries.json          # Input queries for batch processing
 └── src
     └── project
-        ├── chunker.py              # Document chunking logic
-        ├── doc_reader.py           # Reads various document formats
-        ├── embedder.py             # Generates embeddings for text chunks
-        ├── milvus.py               # Milvus client and search functions
-        ├── milvus_bulk_import.py   # Bulk import data into Milvus
-        ├── complete_pipeline_gpu.py # Main data processing pipeline (GPU optimized)
-        ├── complete_pipeline_hybrid.py # Main data processing pipeline (CPU/Hybrid)
-        ├── process_all_queries.py  # Batch query processing script
-        ├── pydantic_models.py      # Core data models for the project
-        └── ...
+        ├── config.py             # Loads .env file and configures Milvus client
+        │
+        ├── # 1. INGESTION WORKFLOW
+        ├── sqlite_setup.py       # Creates SQLite tables (documents, chunks)
+        ├── file_meta_loader.py   # Scans folders, populates 'documents' table
+        ├── complete_pipeline_hybrid.py # <-- MAIN: Streaming Ingestion (Producer/Consumer)
+        │
+        ├── # 2. QUERY WORKFLOW
+        ├── process_all_queries_csv.py # <-- MAIN: Hybrid Search + Reranking
+        │
+        ├── # 3. MILVUS & SCHEMA
+        ├── schema_setup.py       # Creates Milvus collection schema (hybrid)
+        ├── milvus_bulk_import.py # Utility for bulk-loading from MinIO
+        │
+        ├── # 4. CORE UTILITIES
+        ├── doc_reader.py         # Reads .pdf, .txt, .docx, etc.
+        ├── chunker.py            # Splits documents into chunks
+        ├── chunk_cleaner.py      # Cleans text, removes noise
+        └── pydantic_models.py    # Core data models (Document, Chunk)
 ```
 
 ## Main Dependencies
 
-  * `pymilvus`: For interacting with Milvus.
-  * `sentence-transformers`: For text embeddings.
-  * `langchain`: For various text processing utilities.
-  * `pypdf`: For reading PDF files.
-  * `minio`: For the bulk import process.
+A complete list is in `pyproject.toml`. Key libraries include:
 
-A full list of dependencies can be found in the **`pyproject.toml`** file.
+  * `pymilvus`: The Milvus client.
+  * `sentence-transformers`: For query embedding.
+  * `cross-encoder`: For reranking.
+  * `pydantic`: For data models.
+  * `aiosqlite`: For async SQLite operations.
+  * `psutil`: For memory management.
+
+<!-- end list -->
