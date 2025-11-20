@@ -153,7 +153,26 @@ This will:
 3.  Rerank the results using a Cross-Encoder.
 4.  Generate a `submission/` folder with individual JSON results.
 5.  Create a detailed `Final_shortlistingchunks100rerank.csv` file with all results, scores, and chunk text for analysis.
+-----
+📥 Input Data Location
+The pipeline expects input files to be placed in specific locations:
 
+Raw Documents: Add your source files (PDFs, TXT, DOCX, etc.) into the specified source directory, typically data/test.
+
+Query Files: Input queries for batch processing should be added to new_queries.json.
+
+Shared Drive: All input files, including raw documents and queries, are managed in this shared Google Drive folder: Input and Output Files.
+
+📤 Output Data Location
+The retrieval and evaluation workflow generates several key output files:
+
+Query Results: Individual JSON results for each query are generated in the submission/ folder.
+
+Evaluation CSV: The detailed analysis file, Final_shortlistingchunks100rerank.csv, contains all results, scores, and chunk text for evaluation.
+
+Processed Chunks Backup: A backup of all processed chunks is created at prepared_for_upload/processed_chunks.json.
+
+Shared Drive: All generated output files are saved to the following shared Google Drive folder: Input and Output Files.
 -----
 
 ## 📂 Project Structure
